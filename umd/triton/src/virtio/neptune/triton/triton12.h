@@ -1,0 +1,517 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ *
+ * Triton D3D12 DDI: private handle structs behind the D3D12DDI_H*
+ * handles.  As in triton.h for D3D11, the runtime allocates
+ * the private storage (pfnCalcPrivate*Size), we place our struct in it,
+ * and every wrapped Neptune COM pointer is a HOST pointer forwarded
+ * verbatim through the wrapper vtbl layer.
+ */
+
+#ifndef TRITON12_H
+#define TRITON12_H
+
+#include "triton.h"   /* windows.h, d3dkmthk.h, TR_LOG plumbing */
+
+#include <d3d12.h>
+#include <d3d12umddi.h>
+
+struct triton_host_caps12;
+
+/* Command-list types a command pool can back: DIRECT, BUNDLE, COMPUTE,
+ * COPY (D3D12_COMMAND_LIST_TYPE 0..3). */
+#define TRITON12_POOL_TYPES 4
+
+typedef struct TRITON12_ADAPTER
+{
+    D3D12DDI_HRTADAPTER     hRTAdapter;
+    /* Runtime handles of the filled COMMAND_LIST_3D tables (num=0
+     * direct, num=1 bundle), captured in pfnFillDDITable.
+     * pfnCreateCommandList must hand the right one back through
+     * pfnSetCommandListDDITableCb or the runtime dispatches through a
+     * NULL table. */
+    D3D12DDI_HRTTABLE       hRTTableCmdList[2];
+    /* Host capset TRITON_HOSTCAP_* bits (tritonSharedBridgeAdapterProbe),
+     * latched at OpenAdapter12.  Gates every capability whose backing
+     * varies by host backend (DXIL/SM6, FL 12_0). */
+    UINT32                  HostCaps;
+    /* Host feature snapshot (tritonHostCaps.h), taken on the first
+     * GetCaps; every host-backed cap answer translates out of it. */
+    INIT_ONCE               HostCapsOnce;
+    struct triton_host_caps12 *pHostCaps12;
+    /* The inner device the snapshot stood up.  The first CreateDevice
+     * adopts it instead of creating the same device again; CloseAdapter
+     * releases it otherwise. */
+    ID3D12Device           *pCapsDev;
+    /* Whether a texture on a CPU-visible custom heap can be given a CPU
+     * address: the host backend takes the ROW_MAJOR layout, the only one
+     * with one (npt_d3d12_host_takes_row_major_texture).  Probed with the
+     * caps snapshot, before GetCaps answers UMA: D3DMetal reports a
+     * discrete adapter but takes the layout on Apple's unified memory, and
+     * the caps report UMA where either holds. */
+    BOOL                    CpuVisibleTextures;
+} TRITON12_ADAPTER, *PTRITON12_ADAPTER;
+
+/* Command queues per device tracked for cross-queue ordering.  The cap only
+ * bounds the registry walk; overflow degrades to "not ordered against the
+ * extras", never to incorrect behaviour. */
+#define TRITON12_MAX_QUEUES 16
+
+struct npt_ring;
+
+typedef struct TRITON12_DEVICE
+{
+    PTRITON12_ADAPTER            pAdapter;
+    D3D12DDI_HRTDEVICE           hRTDevice;
+    D3DDDI_DEVICECALLBACKS       KTCallbacks;
+    CONST D3D12DDI_CORELAYER_DEVICECALLBACKS_0022 *pUMCallbacks;
+
+    /* Neptune COM wrappers (host-side ID3D12Device behind the wrapper
+     * vtbl layer).  Populated by tritonCreateDevice12 via
+     * npt_d3d12_create_device_internal. */
+    ID3D12Device                *pDev;
+    /* Host TiledResourcesTier (D3D12_OPTIONS on the inner device),
+     * probed once at device create.  >= 1 means the host backs reserved
+     * resources sparsely and honours UpdateTileMappings, so
+     * t12CreateHeapAndResource forwards CreateReservedResource; 0 takes
+     * the committed backing instead. */
+    UINT                         HostTiledTier;
+    /* R4 (_0040+) creates command lists with no allocator; the host API
+     * needs one at create, so each list type gets a device-level scratch
+     * allocator that only ever backs the empty create-then-close.
+     * ScratchLock holds across that create and Close, which are host
+     * calls; it is separate from QueueLock so submissions never wait on
+     * a list create. */
+    ID3D12CommandAllocator      *pScratchAlloc[TRITON12_POOL_TYPES];
+    CRITICAL_SECTION             ScratchLock;
+    /* Escapes, runtime virtio context and residency requests on the
+     * runtime's kernel device (tritonKm.h); its lock is QueueLock. */
+    TRITON_KM                    Km;
+
+    /* ---- cross-queue submission ordering (see t12OrderAgainstSiblings) ----
+     *
+     * Registry of this device's command queues.  Needed because the app's
+     * cross-queue GPU waits never reach the host: the D3D12 runtime services
+     * fences through dxgkrnl monitored-fence packets and never calls
+     * pfnWaitForFence, while t12ExecuteCommandLists forwards the real work to
+     * the host over the ring in user mode.  dxgkrnl parks only the kernel
+     * packets, so the host sees two independent Vulkan queues with no
+     * ordering at all.
+     *
+     * Guarded by QueueLock, which is only ever taken around the (tiny)
+     * registry walk -- never while calling into the inner device. */
+    CRITICAL_SECTION             QueueLock;
+    BOOL                         QueueLockInit;
+    struct TRITON12_QUEUE       *Queues[TRITON12_MAX_QUEUES];
+    UINT                         QueueCount;
+
+    /* ---- tile-mapping decode edge (see t12UpdateTileMappings) ----
+     *
+     * Where in which ring the most recent forwarded tile-mapping update
+     * sits.  Work on any OTHER ring that could consume the mapping waits
+     * for the host to have decoded past this point first.  Also guarded by
+     * QueueLock; cleared when the owning queue goes away. */
+    struct npt_ring             *TileMapRing;
+    UINT32                       TileMapSeqno;
+} TRITON12_DEVICE, *PTRITON12_DEVICE;
+
+static inline PTRITON12_DEVICE
+triton12Device(D3D12DDI_HDEVICE hDevice)
+{
+    return (PTRITON12_DEVICE)hDevice.pDrvPrivate;
+}
+
+/* Whether textures on CPU-visible heaps are built ROW_MAJOR for CPU access
+ * (see TRITON12_ADAPTER). */
+BOOL triton12CpuVisibleTextures(PTRITON12_ADAPTER pAdapter);
+
+typedef struct TRITON12_DESCRIPTOR_HEAP
+{
+    ID3D12DescriptorHeap        *pHeap;
+} TRITON12_DESCRIPTOR_HEAP, *PTRITON12_DESCRIPTOR_HEAP;
+
+typedef struct TRITON12_HEAP
+{
+    ID3D12Heap                  *pHeap;      /* standalone heap, or NULL */
+    ID3D12Resource              *pResource;  /* committed create: the resource
+                                              * owning the implicit heap, so
+                                              * pfnMapHeap can Map it */
+    /* Standalone-heap create desc (type/flags/size), kept so a later
+     * placed-resource create in this heap can rebuild inner-API
+     * arguments without a wire GetDesc round-trip. */
+    D3D12_HEAP_DESC              Desc;
+    /* Residency-only placeholder for a heap created without a covering
+     * buffer; 0 when the heap+buffer shape carried the allocation on the
+     * buffer resource instead. */
+    D3DKMT_HANDLE                hKMAllocation;
+} TRITON12_HEAP, *PTRITON12_HEAP;
+
+typedef struct TRITON12_RESOURCE
+{
+    ID3D12Resource              *pResource;
+    /* Create-time DDI desc, kept for CheckSubresourceInfo /
+     * footprint math without a wire GetDesc round-trip. */
+    D3D12DDIARG_CREATERESOURCE_0003 Desc;
+    /* Whole-heap implicit buffer only (API CreateHeap arrives as heap +
+     * covering BUFFER): the inner heap placed resources alias into.
+     * Borrowed from the owning TRITON12_HEAP (which releases it); placed
+     * creates reach it via ReuseBufferGPUVA.BaseAddress.UMD.hResource. */
+    ID3D12Heap                  *pPlaceHeap;
+    /* That inner heap's properties, so a placed texture can take the
+     * layout its heap's CPU visibility calls for (t12UseCpuLayout). */
+    D3D12_HEAP_PROPERTIES        PlaceProps;
+    /* Runtime resource handle + the shared-blob KM allocation the
+     * runtime's kernel present flips.  Presentable resources only. */
+    D3D12DDI_HRTRESOURCE         hRTResource;
+    D3DKMT_HANDLE                hKMAllocation;
+    /* Present-copy companion.  Simple-2D render targets are created as
+     * NATIVE host textures; hKMAllocation names this same-desc SHARED
+     * linear surface instead, created beside them purely so the swapchain
+     * machinery has a KM allocation to hold.  t12Present copies the
+     * rendered frame into it ahead of the present's GPU-done gate, so
+     * consumers (DWM, scanout) sample a GPU-complete frame.  A non-RT
+     * texture gets one at its first present (t12Present).  NULL for
+     * buffers, primaries (still shared directly) and textures never
+     * presented. */
+    ID3D12Resource              *pCompanion;
+    /* t12Present cannot build a companion for this present source: its
+     * shape has no shared surface, or the host refused the create.  Not
+     * retried; any other failure is retried at the next present. */
+    BOOL                         CompanionFailed;
+    /* Cached host GPU VA (pfnCheckResourceVirtualAddress). */
+    UINT64                       GpuVa;
+    /* Reserved (tiled) resource created on the host with
+     * CreateReservedResource: the tile-mapping and CopyTiles DDIs are
+     * forwarded for it.  FALSE means committed backing, where the
+     * mapping DDIs have nothing to do. */
+    BOOL                         TiledHost;
+    /* hKMAllocation is the residency-only placeholder from
+     * triton12RegisterResidencyAlloc rather than a shared blob: it names no
+     * memory, so a kernel present of it copies nothing.  t12Present gives
+     * a present source a companion in its place where the source's shape
+     * allows one. */
+    BOOL                         ResidencyOnlyAlloc;
+    void                        *pShared;
+} TRITON12_RESOURCE, *PTRITON12_RESOURCE;
+
+typedef struct TRITON12_QUERYHEAP
+{
+    ID3D12QueryHeap             *pHeap;
+} TRITON12_QUERYHEAP, *PTRITON12_QUERYHEAP;
+
+typedef struct TRITON12_FENCE
+{
+    ID3D12Fence                 *pFence;
+} TRITON12_FENCE, *PTRITON12_FENCE;
+
+typedef struct TRITON12_QUEUE
+{
+    ID3D12CommandQueue          *pQueue;
+    PTRITON12_DEVICE             pDev;
+    /* Per-queue kernel context (pfnCreateContextVirtualCb): the runtime
+     * binds it to hRTCommandQueue and performs its kernel-side fence
+     * signals/waits against it -- without one, Queue::Signal throws
+     * STATUS_INVALID_PARAMETER. */
+    D3D12DDI_HRTCOMMANDQUEUE     hRTCommandQueue;
+    HANDLE                       hKMContext;
+    /* Monitored-fence gate state: the runtime services app fences through
+     * dxgkrnl packets on hKMContext, which complete when the context's
+     * prior DMA completes.  Per ECL batch we Signal pDrainFence on the
+     * inner host queue and submit a VIOGPU_CMD_GATE DMA packet
+     * that the KMD parks until the host GPU truly reached DrainValue --
+     * making every fence the app observes GPU-true.  See tritonQueue12.c. */
+    ID3D12Fence                 *pDrainFence;
+    /* Guards DrainValue and the Signal that publishes it (t12DrainSignal). */
+    SRWLOCK                      DrainLock;
+    UINT64                       DrainValue;
+    /* Highest drain value whose Signal is already encoded into the wire
+     * ring.  Cross-queue ordering must wait only on values a sibling has
+     * actually sent: a Wait on a value whose Signal is not yet in the
+     * ring is never resolved by the host's in-order submission. */
+    UINT64                       DrainVisible;
+    /* Auto-reset event the present-fence arm in t12Present waits on, so the
+     * frame is not reported to the compositor until the GPU has finished it.
+     * One per queue rather than one per frame -- each arm mints its own
+     * single-use proxy token, so reusing the handle is safe, and a
+     * per-present CreateEvent would churn a handle on every frame. */
+    HANDLE                       hPresentArmEvent;
+    /* High-resolution 1 ms slice timer for the present wait.  The drain
+     * fence's completed value is published through its feedback slot on a
+     * ~100 us host cadence -- a faster path than the KMD completion event
+     * (SEOC -> host eventfd -> sync worker -> virtio -> DPC -> waiter pool,
+     * a multiple-ms floor on the D3D11 side) -- so t12Present polls the
+     * value on 1 ms slices with the event as only a wake hint.  A
+     * HIGH_RESOLUTION waitable timer, not a Wait timeout: timeouts quantize
+     * to the process timer resolution (15.6 ms unless the app raised it). */
+    HANDLE                       hPresentPaceTimer;
+    /* Slot in pDev->Queues, and the highest drain value this queue has already
+     * ordered itself behind for each sibling slot.  Keeping the high-water
+     * mark stops us re-emitting a Wait for work we are already ordered after,
+     * which would otherwise add one wait per sibling per ECL for the whole
+     * run. */
+    UINT                         Slot;
+    UINT64                       XQueueSeen[TRITON12_MAX_QUEUES];
+    /* Present-copy rig (companion resources, tritonPresent12.c): one list
+     * re-recorded against a small allocator ring.  A ring rather than one
+     * allocator because a KMD-gated present returns with its copy still
+     * in flight; CopyAllocValue[i] is the drain-fence value whose
+     * completion proves allocator i's list has executed and it is safe to
+     * Reset.  Built lazily at the first companion present; presents on a
+     * queue are runtime-serialised, so no lock. */
+#define TRITON12_COPY_RING 4
+    ID3D12CommandAllocator      *pCopyAlloc[TRITON12_COPY_RING];
+    UINT64                       CopyAllocValue[TRITON12_COPY_RING];
+    ID3D12GraphicsCommandList   *pCopyList;
+    UINT                         CopyIdx;
+    BOOL                         CopyRigDead; /* build failed; don't retry */
+} TRITON12_QUEUE, *PTRITON12_QUEUE;
+
+/* A 64-bit value another thread updates: a plain load can tear on x86.
+ * The x86 path writes (lock cmpxchg8b), so it is for guest-owned writable
+ * memory only, never a read-only fence or feedback mapping. */
+static __inline UINT64
+t12Load64(volatile const UINT64 *p)
+{
+#ifdef _WIN64
+    return *p;
+#else
+    return (UINT64)InterlockedCompareExchange64((volatile LONG64 *)p, 0, 0);
+#endif
+}
+
+/* Mint the queue's next drain value, Signal it on the host queue and
+ * publish it as DrainVisible, as one step: values minted concurrently
+ * must reach the wire in order, or the fence override sees a Signal below
+ * its high-water mark, treats the fence as rewound and drops its
+ * completed-value fast paths for good.  Returns the Signal's HRESULT;
+ * *pValue gets the minted value either way. */
+static __inline HRESULT
+t12DrainSignal(PTRITON12_QUEUE q, UINT64 *pValue)
+{
+    AcquireSRWLockExclusive(&q->DrainLock);
+    const UINT64 v = ++q->DrainValue;
+    const HRESULT hr = ID3D12CommandQueue_Signal(q->pQueue, q->pDrainFence, v);
+    if (SUCCEEDED(hr))
+        InterlockedExchange64((volatile LONG64 *)&q->DrainVisible, (LONG64)v);
+    ReleaseSRWLockExclusive(&q->DrainLock);
+    *pValue = v;
+    return hr;
+}
+
+typedef struct TRITON12_ALLOCATOR
+{
+    ID3D12CommandAllocator      *pAlloc;
+} TRITON12_ALLOCATOR, *PTRITON12_ALLOCATOR;
+
+/* DDI R4 (_0040+) replaces command allocators with pools and recorders:
+ * a pool owns the command memory, a recorder is the per-thread recording
+ * context that targets one pool at a time, and lists reset against a
+ * recorder.  The host API still thinks in allocators, so a pool carries
+ * one host allocator per command-list type, created on first reset of a
+ * list of that type (the pool's own create names no type). */
+typedef struct TRITON12_POOL
+{
+    ID3D12CommandAllocator      *pAlloc[TRITON12_POOL_TYPES];
+} TRITON12_POOL, *PTRITON12_POOL;
+
+typedef struct TRITON12_RECORDER
+{
+    D3D12DDI_COMMAND_QUEUE_FLAGS QueueFlags;
+    PTRITON12_POOL               pPool;
+} TRITON12_RECORDER, *PTRITON12_RECORDER;
+
+typedef struct TRITON12_LIST
+{
+    ID3D12GraphicsCommandList   *pList;
+    /* Newer interfaces of pList, resolved on first use (t12ListIface) so
+     * recording entries do not QueryInterface per call.  IfaceTried marks
+     * an index as resolved, NULL included.  A list records on one thread
+     * at a time, so no lock. */
+    void                        *pIface[3];
+    UINT                         IfaceTried;
+    PTRITON12_DEVICE             pDev;
+    /* Recording-thread stamp, kept only under
+     * NPT_DEBUG=d3d12_list_migration.  A change between Reset and Close
+     * means the runtime migrated this list across threads mid-recording
+     * — under multi-ring the wire then splits the list across TLS rings
+     * with no intra-list ordering. */
+    DWORD                        RecordTid;
+    /* R4: the list's API type, to pick the pool allocator at reset, and
+     * whether the create-time close still awaits the runtime's paired
+     * reset (a recording call before that reset would hit a closed host
+     * list). */
+    UINT                         ApiType;
+    BOOL                         AwaitingReset;
+} TRITON12_LIST, *PTRITON12_LIST;
+
+/* Each object family installs its own slots into the tables the runtime
+ * hands to pfnFillDDITable. */
+void triton12InstallDescriptorFuncs(D3D12DDI_DEVICE_FUNCS_CORE_0022 *t);
+void triton12InstallResourceFuncs(D3D12DDI_DEVICE_FUNCS_CORE_0022 *t);
+void triton12InstallQueueDeviceFuncs(D3D12DDI_DEVICE_FUNCS_CORE_0022 *t);
+void triton12InstallQueueFuncs(D3D12DDI_COMMAND_QUEUE_FUNCS_CORE_0001 *t);
+/* Park the queue's kernel context behind the GPU completion of everything
+ * submitted to its host queue so far (see tritonQueue12.c).  FALSE when no
+ * gate packet was submitted, so nothing holds the context back. */
+BOOL triton12QueueGate(PTRITON12_QUEUE q);
+void triton12InstallListDeviceFuncs(D3D12DDI_DEVICE_FUNCS_CORE_0022 *t);
+void triton12InstallListFuncs(D3D12DDI_COMMAND_LIST_FUNCS_3D_0022 *t);
+void triton12InstallPipelineFuncs(D3D12DDI_DEVICE_FUNCS_CORE_0022 *t);
+void triton12InstallPresentFuncs(D3D12DDI_COMMAND_LIST_FUNCS_3D_0022 *t);
+void triton12InstallPresentDeviceFuncs(D3D12DDI_DEVICE_FUNCS_CORE_0022 *t);
+void triton12InstallQueryDeviceFuncs(D3D12DDI_DEVICE_FUNCS_CORE_0022 *t);
+/* _0033 overrides: only the slots whose DDI signature changed past _0022
+ * (the tables share member order, so the _0022 image is copied first). */
+void triton12InstallQueueDeviceFuncs0033(D3D12DDI_DEVICE_FUNCS_CORE_0033 *t);
+void triton12InstallResourceFuncs0033(D3D12DDI_DEVICE_FUNCS_CORE_0033 *t);
+void triton12InstallListFuncs0033(D3D12DDI_COMMAND_LIST_FUNCS_3D_0033 *t);
+void triton12InstallPresentFuncs0033(D3D12DDI_COMMAND_LIST_FUNCS_3D_0033 *t);
+/* _0043: pools/recorders replace allocators; lists create without one. */
+void triton12InstallListDeviceFuncs0043(D3D12DDI_DEVICE_FUNCS_CORE_0043 *t);
+void triton12InstallListFuncs0040(D3D12DDI_COMMAND_LIST_FUNCS_3D_0040 *t);
+void triton12InstallResourceFuncs0043(D3D12DDI_DEVICE_FUNCS_CORE_0043 *t);
+/* _0062: queue create takes a scheduling group (never created), present
+ * moves its handles into broadcast arrays / an optional contexts struct,
+ * and the meta-command / state-object / raytracing / VRS slots get
+ * bodies that report "none" rather than the generic stub. */
+void triton12InstallQueueDeviceFuncs0062(D3D12DDI_DEVICE_FUNCS_CORE_0062 *t);
+void triton12InstallPresentFuncs0062(D3D12DDI_COMMAND_LIST_FUNCS_3D_0062 *t);
+void triton12InstallListDeviceFuncs0062(D3D12DDI_DEVICE_FUNCS_CORE_0062 *t);
+void triton12InstallListFuncs0062(D3D12DDI_COMMAND_LIST_FUNCS_3D_0062 *t);
+/* _0080/_0074: the PSO args gain the mesh/amplification shader handles
+ * (read by the _0075 PSO create), the resource desc a sampler-feedback mip
+ * region the handlers never read; DispatchMesh and the mesh shader creates
+ * are forwarded and the remaining new slots report "none". */
+void triton12InstallPipelineFuncs0080(D3D12DDI_DEVICE_FUNCS_CORE_0080 *t);
+void triton12InstallResourceFuncs0080(D3D12DDI_DEVICE_FUNCS_CORE_0080 *t);
+void triton12InstallListDeviceFuncs0080(D3D12DDI_DEVICE_FUNCS_CORE_0080 *t);
+void triton12InstallListFuncs0074(D3D12DDI_COMMAND_LIST_FUNCS_3D_0074 *t);
+
+/* Give a presentable committed resource its shared-blob KM allocation,
+ * which the runtime's kernel present needs to flip it.  pSurf is the host
+ * surface whose blob backs the allocation: NULL exports r->pResource
+ * itself (the resource IS the shared surface — primaries), non-NULL
+ * exports that surface instead (the present-copy companion) while the
+ * allocation is still registered against r's runtime handle. */
+BOOL triton12RegisterSharedBlob(PTRITON12_DEVICE p, PTRITON12_RESOURCE r,
+                                BOOL primary, ID3D12Resource *pSurf);
+
+/* Give a resource a KM allocation that names no memory, so runtime-serviced
+ * residency operations accept it (see VIOGPU_BLOB_FLAG_RESIDENCY_ONLY in
+ * wddm_hw.h).  Returns FALSE when the resource already has one or the
+ * allocation callback is unavailable. */
+BOOL triton12RegisterResidencyAlloc(PTRITON12_DEVICE p, PTRITON12_RESOURCE r);
+/* Free a KM allocation this driver minted with pfnAllocateCb (shared blob
+ * or residency-only placeholder) and clear *phAllocation.  The runtime does
+ * not free driver-minted allocations with the resource. */
+void triton12DeallocateKM(PTRITON12_DEVICE p, D3DKMT_HANDLE *phAllocation);
+
+/* Give r a shared linear companion surface whose blob backs its KM
+ * allocation (the present copies the frame into it); desc/props are
+ * the resource's own.  Replaces a residency-only placeholder.  Returns
+ * the host's answer to the create, or E_FAIL when registering the blob
+ * failed. */
+/* Present companions, implemented by the embedding DLL. */
+HRESULT tritonShared12CreateCompanion(PTRITON12_DEVICE p, PTRITON12_RESOURCE r,
+                                      const D3D12_RESOURCE_DESC *desc);
+BOOL tritonShared12RecordCopy(PTRITON12_DEVICE p,
+                              ID3D12GraphicsCommandList *list,
+                              PTRITON12_RESOURCE r);
+void tritonShared12Destroy(PTRITON12_DEVICE p, PTRITON12_RESOURCE r);
+
+HRESULT triton12CreateCompanion(PTRITON12_DEVICE p, PTRITON12_RESOURCE r,
+                             const D3D12_HEAP_PROPERTIES *props,
+                             const D3D12_RESOURCE_DESC *desc);
+
+/* The bare allocation, for objects with no TRITON12_RESOURCE (standalone
+ * heaps).  Returns 0 on failure. */
+D3DKMT_HANDLE triton12AllocResidencyOnly(PTRITON12_DEVICE p,
+                                         HANDLE hRTResource);
+
+/* ---------- tiled resources: standard tile geometry ---------- */
+
+/* One D3D12 tile of a 2D resource.  An "element" is a texel for an
+ * uncompressed format and a 4x4 block for BC, which is the unit the tile
+ * shape is defined in. */
+typedef struct TRITON12_TILE_SHAPE
+{
+    UINT ElemBytes;      /* bytes per element */
+    UINT BlockEdge;      /* texels per element edge: 1, or 4 for BC */
+    UINT ElemW, ElemH;   /* tile extent in elements */
+    UINT TexelW, TexelH; /* the same extent in texels */
+    UINT RowBytes;       /* one element row of the tile */
+} TRITON12_TILE_SHAPE;
+
+static inline void
+t12TileShape(DXGI_FORMAT fmt, TRITON12_TILE_SHAPE *out)
+{
+    UINT elemBytes, blockEdge = 1;
+    switch (fmt) {
+    case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM:
+    case DXGI_FORMAT_BC1_UNORM_SRGB: case DXGI_FORMAT_BC4_TYPELESS:
+    case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM:
+        elemBytes = 8; blockEdge = 4; break;
+    case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM:
+    case DXGI_FORMAT_BC2_UNORM_SRGB: case DXGI_FORMAT_BC3_TYPELESS:
+    case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+    case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM:
+    case DXGI_FORMAT_BC5_SNORM: case DXGI_FORMAT_BC6H_TYPELESS:
+    case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16:
+    case DXGI_FORMAT_BC7_TYPELESS: case DXGI_FORMAT_BC7_UNORM:
+    case DXGI_FORMAT_BC7_UNORM_SRGB:
+        elemBytes = 16; blockEdge = 4; break;
+    case DXGI_FORMAT_R8_TYPELESS: case DXGI_FORMAT_R8_UNORM:
+    case DXGI_FORMAT_R8_UINT: case DXGI_FORMAT_R8_SNORM:
+    case DXGI_FORMAT_R8_SINT: case DXGI_FORMAT_A8_UNORM:
+        elemBytes = 1; break;
+    case DXGI_FORMAT_R8G8_TYPELESS: case DXGI_FORMAT_R8G8_UNORM:
+    case DXGI_FORMAT_R8G8_UINT: case DXGI_FORMAT_R8G8_SNORM:
+    case DXGI_FORMAT_R8G8_SINT: case DXGI_FORMAT_R16_TYPELESS:
+    case DXGI_FORMAT_R16_FLOAT: case DXGI_FORMAT_R16_UNORM:
+    case DXGI_FORMAT_R16_UINT: case DXGI_FORMAT_R16_SNORM:
+    case DXGI_FORMAT_R16_SINT: case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_B5G6R5_UNORM: case DXGI_FORMAT_B5G5R5A1_UNORM:
+    case DXGI_FORMAT_B4G4R4A4_UNORM:
+        elemBytes = 2; break;
+    case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+    case DXGI_FORMAT_R32G32B32A32_FLOAT:
+    case DXGI_FORMAT_R32G32B32A32_UINT:
+    case DXGI_FORMAT_R32G32B32A32_SINT:
+        elemBytes = 16; break;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:
+    case DXGI_FORMAT_R16G16B16A16_UNORM:
+    case DXGI_FORMAT_R16G16B16A16_UINT:
+    case DXGI_FORMAT_R16G16B16A16_SNORM:
+    case DXGI_FORMAT_R16G16B16A16_SINT: case DXGI_FORMAT_R32G32_TYPELESS:
+    case DXGI_FORMAT_R32G32_FLOAT: case DXGI_FORMAT_R32G32_UINT:
+    case DXGI_FORMAT_R32G32_SINT:
+        elemBytes = 8; break;
+    default:
+        /* The broad 32-bit class (R8G8B8A8*, B8G8R8A8*, R10G10B10A2*,
+         * R11G11B10, R16G16*, R32*, D32_FLOAT, D24S8, ...).  The 96-bit
+         * formats land here too and are wrong for them, but D3D12 has no
+         * standard tile shape for 96 bpp and forbids tiling them. */
+        elemBytes = 4; break;
+    }
+
+    /* A tile holds TILE_SIZE/ElemBytes elements arranged as the squarest
+     * power-of-two rectangle, the wider side first.  That reproduces
+     * D3D12's standard tile-shape table: 256x256 elements at one byte
+     * each, halving alternately down to 64x64 at sixteen. */
+    UINT log2Elems = 0;
+    while (((UINT)D3D12_TILED_RESOURCE_TILE_SIZE_IN_BYTES >> log2Elems) >
+           elemBytes)
+        log2Elems++;
+
+    out->ElemBytes = elemBytes;
+    out->BlockEdge = blockEdge;
+    out->ElemW = 1u << ((log2Elems + 1u) / 2u);
+    out->ElemH = 1u << (log2Elems / 2u);
+    out->TexelW = out->ElemW * blockEdge;
+    out->TexelH = out->ElemH * blockEdge;
+    out->RowBytes = out->ElemW * elemBytes;
+}
+
+#endif /* TRITON12_H */

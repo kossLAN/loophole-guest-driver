@@ -1,0 +1,64 @@
+<Project DefaultTargets="Package">
+  <!-- viogpu3d.sys, then out\package from it and out\x64 and out\x86: the driver package, stamped,
+       catalogued and test-signed; the per-game layers; and loophole-setup.exe. -->
+
+  <PropertyGroup>
+    <Configuration Condition="'$(Configuration)' == ''">Release</Configuration>
+    <Root>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)', '..'))</Root>
+    <Out>$(Root)out\</Out>
+    <Package>$(Out)package\</Package>
+    <!-- The fourth part of the driver version, by default one that changes with every build:
+         Windows reuses a staged package whose INF is unchanged, binaries and all. -->
+    <BuildNumber Condition="'$(BuildNumber)' == ''">$([MSBuild]::Add($([MSBuild]::Multiply($([System.DateTime]::Now.Hour), 100)), $([System.DateTime]::Now.Minute)))</BuildNumber>
+    <Version>1.0.0.$(BuildNumber)</Version>
+
+    <KitsRoot Condition="'$(KitsRoot)' == ''">$([MSBuild]::GetRegistryValueFromView('HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots', 'KitsRoot10', null, RegistryView.Registry32))</KitsRoot>
+    <!-- The SDK kmd\viogpu3d.vcxproj builds against. -->
+    <KitsBin>$(KitsRoot)bin\10.0.26100.0\</KitsBin>
+    <Inf2Cat Condition="'$(Inf2Cat)' == ''">$(KitsBin)x86\Inf2Cat.exe</Inf2Cat>
+    <SignTool Condition="'$(SignTool)' == ''">$(KitsBin)x64\signtool.exe</SignTool>
+    <StampInf Condition="'$(StampInf)' == ''">$(KitsBin)x64\stampinf.exe</StampInf>
+    <MakeNsis Condition="'$(MakeNsis)' == ''">$(MSBuildProgramFiles32)\NSIS\makensis.exe</MakeNsis>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <DriverFile Include="$(Root)kmd\viogpu3d.inf" Name="viogpu3d.inf" />
+    <!-- Under the names viogpu3d.inf's [SourceDisksFiles] lists. -->
+    <DriverFile Include="$(Out)kmd\$(Configuration)\viogpu3d.sys" Name="viogpu3d.sys" />
+    <DriverFile Include="$(Out)x64\umd\loophole_umd.dll" Name="loophole_umd.dll" />
+    <DriverFile Include="$(Out)x64\dxvk\dxgi.dll" Name="loophole_dxgi.dll" />
+    <DriverFile Include="$(Out)x64\dxvk\d3d11.dll" Name="loophole_d3d11.dll" />
+    <DriverFile Include="$(Out)x64\vkd3d-proton\d3d12core.dll" Name="loophole_d3d12core.dll" />
+    <DriverFile Include="$(Out)x64\mesa-radv\vulkan_radeon.dll" Name="vulkan_radeon.dll" />
+    <DriverFile Include="$(Root)kmd\radeon_icd.json" Name="radeon_icd.json" />
+    <DriverFile Include="$(Out)x86\umd\loophole_umd.dll" Name="loophole32_umd.dll" />
+    <DriverFile Include="$(Out)x86\dxvk\dxgi.dll" Name="loophole32_dxgi.dll" />
+    <DriverFile Include="$(Out)x86\dxvk\d3d11.dll" Name="loophole32_d3d11.dll" />
+    <DriverFile Include="$(Out)x86\vkd3d-proton\d3d12core.dll" Name="loophole32_d3d12core.dll" />
+    <DriverFile Include="$(Out)x86\mesa-radv\vulkan_radeon.dll" Name="vulkan_radeon32.dll" />
+    <DriverFile Include="$(Root)kmd\radeon_icd32.json" Name="radeon_icd32.json" />
+    <DriverFile Include="$(Root)kmd\cert\loophole-test.cer" Name="loophole-test.cer" />
+
+    <!-- DXVK, vkd3d-proton, Zink and the Vulkan loader, for per-game use. -->
+    <Layer Include="$(Out)x64\dxvk\*.dll;$(Out)x64\vkd3d-proton\*.dll;$(Out)x64\mesa-zink\*.dll;$(Out)x64\vulkan-loader\*" Arch="x64" />
+    <Layer Include="$(Out)x86\dxvk\*.dll;$(Out)x86\vkd3d-proton\*.dll;$(Out)x86\mesa-zink\*.dll;$(Out)x86\vulkan-loader\*" Arch="x86" />
+  </ItemGroup>
+
+  <Target Name="Package">
+    <MSBuild Projects="$(Root)kmd\viogpu3d.vcxproj" Properties="Configuration=$(Configuration);Platform=x64;LoopholeVersion=$(Version)" />
+    <Error Condition="!Exists('%(DriverFile.FullPath)')" Text="missing %(DriverFile.FullPath): build out\x64 and out\x86 first (make, on Linux)" />
+
+    <RemoveDir Directories="$(Package)" />
+    <Copy SourceFiles="@(DriverFile)" DestinationFiles="@(DriverFile->'$(Package)drivers\%(Name)')" />
+    <Exec Command="&quot;$(StampInf)&quot; -f &quot;$(Package)drivers\viogpu3d.inf&quot; -d &quot;*&quot; -v $(Version)" />
+    <Copy Condition="Exists('$(Out)kmd\$(Configuration)\viogpu3d.pdb')" SourceFiles="$(Out)kmd\$(Configuration)\viogpu3d.pdb" DestinationFolder="$(Package)symbols" />
+    <Exec Command="&quot;$(Inf2Cat)&quot; /driver:&quot;$(Package)drivers&quot; /os:10_X64 /uselocaltime" />
+    <Exec Command="&quot;$(SignTool)&quot; sign /q /fd SHA256 /f &quot;$(Root)kmd\cert\loophole-test.pfx&quot; /p loophole &quot;$(Package)drivers\viogpu3d.cat&quot;" />
+
+    <Copy SourceFiles="@(Layer)" DestinationFolder="$(Package)layers\%(Arch)" />
+    <Exec Command="&quot;$(MakeNsis)&quot; -V2 -INPUTCHARSET UTF8 -DVERSION=1.0.$(BuildNumber) &quot;-DTOOLS=$(Out)x64\setup&quot; &quot;-DPACKAGE=$(Package.TrimEnd('\'))&quot; &quot;$(Root)installer\loophole.nsi&quot;" />
+
+    <WriteLinesToFile File="$(Package)version.txt" Lines="$(Version)" Overwrite="true" />
+    <Message Importance="high" Text="driver $(Version): $(Package)" />
+  </Target>
+</Project>

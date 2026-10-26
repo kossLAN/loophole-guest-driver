@@ -1,0 +1,1303 @@
+/*
+ * Copyright 2026 Turing Software LLC
+ * SPDX-License-Identifier: MIT
+ *
+ * DDI thunk declarations + per-tier _DEVICEFUNCS tables, plus the
+ * OpenAdapter10_2 export and adapter-level callbacks.
+ *
+ * OpenAdapter10_2 is the single entry point the WDDM runtime calls to
+ * discover our adapter. It returns a D3D10_2DDI_ADAPTERFUNCS table whose
+ * pfnCreateDevice fills in the device function table for the requested
+ * DDI interface version.
+ */
+
+#include "triton.h"
+#include "triton_log.h"
+/* npt_log for the DestroyDevice drain timeout: unbuffered WriteFile, so the
+ * report survives a run with no debugger attached and output redirected. */
+#include "npt_common.h"
+#include "tritonDxgi.h"
+#include "tritonPresent.h"
+#include "tritonSharedBridge.h"
+#include "tritonHostCaps.h"
+
+/* Statically linked from src/virtio/neptune/npt_entry_d3d11.c.  The
+ * function pulls in the protocol-generated COM machinery internally;
+ * declaring the extern here lets tritonCreateDevice call it without
+ * dragging the protocol headers into Triton's SDK-flavoured include
+ * graph. */
+extern HRESULT
+npt_d3d11_create_device_internal(IDXGIAdapter *pAdapter,
+                                 D3D_DRIVER_TYPE DriverType,
+                                 HMODULE Software,
+                                 UINT Flags,
+                                 const D3D_FEATURE_LEVEL *pFeatureLevels,
+                                 UINT FeatureLevels,
+                                 UINT SDKVersion,
+                                 ID3D11Device **ppDevice,
+                                 D3D_FEATURE_LEVEL *pFeatureLevel,
+                                 ID3D11DeviceContext **ppImmediateContext);
+
+/* Forward declarations of handlers implemented in other translation
+ * units. APIENTRY signatures keep the function-table installs free of
+ * casts where possible. */
+
+/* tritonResource.c */
+SIZE_T APIENTRY tritonCalcPrivateResourceSize(D3D10DDI_HDEVICE,
+                                              const D3D11DDIARG_CREATERESOURCE *);
+SIZE_T APIENTRY tritonCalcPrivateOpenedResourceSize(D3D10DDI_HDEVICE,
+                                                    const D3D10DDIARG_OPENRESOURCE *);
+void   APIENTRY tritonCreateResource(D3D10DDI_HDEVICE,
+                                     const D3D11DDIARG_CREATERESOURCE *, D3D10DDI_HRESOURCE, D3D10DDI_HRTRESOURCE);
+void   APIENTRY tritonDestroyResource(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE);
+void   APIENTRY tritonOpenResource(D3D10DDI_HDEVICE, const D3D10DDIARG_OPENRESOURCE *, D3D10DDI_HRESOURCE, D3D10DDI_HRTRESOURCE);
+
+/* tritonView.c */
+SIZE_T APIENTRY tritonCalcPrivateRenderTargetViewSize(D3D10DDI_HDEVICE,
+                                                      const D3D10DDIARG_CREATERENDERTARGETVIEW *);
+void   APIENTRY tritonCreateRenderTargetView(D3D10DDI_HDEVICE,
+                                             const D3D10DDIARG_CREATERENDERTARGETVIEW *, D3D10DDI_HRENDERTARGETVIEW, D3D10DDI_HRTRENDERTARGETVIEW);
+void   APIENTRY tritonDestroyRenderTargetView(D3D10DDI_HDEVICE, D3D10DDI_HRENDERTARGETVIEW);
+void   APIENTRY tritonClearRenderTargetView(D3D10DDI_HDEVICE, D3D10DDI_HRENDERTARGETVIEW, FLOAT[4]);
+void   APIENTRY tritonClearDepthStencilView(D3D10DDI_HDEVICE, D3D10DDI_HDEPTHSTENCILVIEW,
+                                            UINT, FLOAT, UINT8);
+void   APIENTRY tritonFlush(D3D10DDI_HDEVICE);
+BOOL   APIENTRY tritonFlush11_1(D3D10DDI_HDEVICE, UINT);
+void   APIENTRY tritonSetRenderTargets(D3D10DDI_HDEVICE,
+                                       const D3D10DDI_HRENDERTARGETVIEW *,
+                                       UINT, UINT, D3D10DDI_HDEPTHSTENCILVIEW,
+                                       const D3D11DDI_HUNORDEREDACCESSVIEW *,
+                                       const UINT *,
+                                       UINT, UINT, UINT, UINT);
+
+/* tritonState.c */
+SIZE_T APIENTRY tritonCalcPrivateBlendStateSize(D3D10DDI_HDEVICE, const D3D11_1_DDI_BLEND_DESC *);
+void   APIENTRY tritonCreateBlendState(D3D10DDI_HDEVICE, const D3D11_1_DDI_BLEND_DESC *, D3D10DDI_HBLENDSTATE, D3D10DDI_HRTBLENDSTATE);
+void   APIENTRY tritonDestroyBlendState(D3D10DDI_HDEVICE, D3D10DDI_HBLENDSTATE);
+void   APIENTRY tritonSetBlendState(D3D10DDI_HDEVICE, D3D10DDI_HBLENDSTATE, const FLOAT[4], UINT);
+SIZE_T APIENTRY tritonCalcPrivateBlendStateSize_10(D3D10DDI_HDEVICE, const D3D10_1_DDI_BLEND_DESC *);
+void   APIENTRY tritonCreateBlendState_10(D3D10DDI_HDEVICE, const D3D10_1_DDI_BLEND_DESC *, D3D10DDI_HBLENDSTATE, D3D10DDI_HRTBLENDSTATE);
+
+SIZE_T APIENTRY tritonCalcPrivateDepthStencilStateSize(D3D10DDI_HDEVICE,
+                                                       const D3D10_DDI_DEPTH_STENCIL_DESC *);
+void   APIENTRY tritonCreateDepthStencilState(D3D10DDI_HDEVICE, const D3D10_DDI_DEPTH_STENCIL_DESC *, D3D10DDI_HDEPTHSTENCILSTATE, D3D10DDI_HRTDEPTHSTENCILSTATE);
+void   APIENTRY tritonDestroyDepthStencilState(D3D10DDI_HDEVICE, D3D10DDI_HDEPTHSTENCILSTATE);
+void   APIENTRY tritonSetDepthStencilState(D3D10DDI_HDEVICE, D3D10DDI_HDEPTHSTENCILSTATE, UINT);
+
+SIZE_T APIENTRY tritonCalcPrivateRasterizerStateSize(D3D10DDI_HDEVICE,
+                                                     const D3D11_1_DDI_RASTERIZER_DESC *);
+void   APIENTRY tritonCreateRasterizerState(D3D10DDI_HDEVICE, const D3D11_1_DDI_RASTERIZER_DESC *, D3D10DDI_HRASTERIZERSTATE, D3D10DDI_HRTRASTERIZERSTATE);
+void   APIENTRY tritonDestroyRasterizerState(D3D10DDI_HDEVICE, D3D10DDI_HRASTERIZERSTATE);
+void   APIENTRY tritonSetRasterizerState(D3D10DDI_HDEVICE, D3D10DDI_HRASTERIZERSTATE);
+SIZE_T APIENTRY tritonCalcPrivateRasterizerStateSize_10(D3D10DDI_HDEVICE,
+                                                        const D3D10_DDI_RASTERIZER_DESC *);
+void   APIENTRY tritonCreateRasterizerState_10(D3D10DDI_HDEVICE,
+                                               const D3D10_DDI_RASTERIZER_DESC *, D3D10DDI_HRASTERIZERSTATE, D3D10DDI_HRTRASTERIZERSTATE);
+
+SIZE_T APIENTRY tritonCalcPrivateSamplerSize(D3D10DDI_HDEVICE, const D3D10_DDI_SAMPLER_DESC *);
+void   APIENTRY tritonCreateSampler(D3D10DDI_HDEVICE, const D3D10_DDI_SAMPLER_DESC *, D3D10DDI_HSAMPLER, D3D10DDI_HRTSAMPLER);
+void   APIENTRY tritonDestroySampler(D3D10DDI_HDEVICE, D3D10DDI_HSAMPLER);
+void   APIENTRY tritonPsSetSamplers(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSAMPLER *);
+void   APIENTRY tritonVsSetSamplers(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSAMPLER *);
+
+SIZE_T APIENTRY tritonCalcPrivateElementLayoutSize(D3D10DDI_HDEVICE,
+                                                   const D3D10DDIARG_CREATEELEMENTLAYOUT *);
+void   APIENTRY tritonCreateElementLayout(D3D10DDI_HDEVICE,
+                                          const D3D10DDIARG_CREATEELEMENTLAYOUT *, D3D10DDI_HELEMENTLAYOUT, D3D10DDI_HRTELEMENTLAYOUT);
+void   APIENTRY tritonDestroyElementLayout(D3D10DDI_HDEVICE, D3D10DDI_HELEMENTLAYOUT);
+void   APIENTRY tritonIaSetInputLayout(D3D10DDI_HDEVICE, D3D10DDI_HELEMENTLAYOUT);
+
+void   APIENTRY tritonSetViewports(D3D10DDI_HDEVICE, UINT, UINT, const D3D10_DDI_VIEWPORT *);
+void   APIENTRY tritonSetScissorRects(D3D10DDI_HDEVICE, UINT, UINT, const D3D10_DDI_RECT *);
+void   APIENTRY tritonIaSetTopology(D3D10DDI_HDEVICE, D3D10_DDI_PRIMITIVE_TOPOLOGY);
+
+/* tritonShader.c */
+SIZE_T APIENTRY tritonCalcPrivateShaderSize(D3D10DDI_HDEVICE, const UINT *, const VOID *);
+SIZE_T APIENTRY tritonCalcPrivateTessellationShaderSize(D3D10DDI_HDEVICE, const UINT *, const VOID *);
+void   APIENTRY tritonCreateVertexShader(D3D10DDI_HDEVICE, const UINT *, D3D10DDI_HSHADER, D3D10DDI_HRTSHADER, const VOID *);
+void   APIENTRY tritonCreatePixelShader(D3D10DDI_HDEVICE, const UINT *, D3D10DDI_HSHADER, D3D10DDI_HRTSHADER, const VOID *);
+void   APIENTRY tritonDestroyShader(D3D10DDI_HDEVICE, D3D10DDI_HSHADER);
+void   APIENTRY tritonVsSetShader(D3D10DDI_HDEVICE, D3D10DDI_HSHADER);
+void   APIENTRY tritonPsSetShader(D3D10DDI_HDEVICE, D3D10DDI_HSHADER);
+void   APIENTRY tritonGsSetShader(D3D10DDI_HDEVICE, D3D10DDI_HSHADER);
+void   APIENTRY tritonHsSetShader(D3D10DDI_HDEVICE, D3D10DDI_HSHADER);
+void   APIENTRY tritonDsSetShader(D3D10DDI_HDEVICE, D3D10DDI_HSHADER);
+void   APIENTRY tritonCsSetShader(D3D10DDI_HDEVICE, D3D10DDI_HSHADER);
+#define TR_DECL_SET_SHADER_WITH_IFACES(stage) \
+    void APIENTRY triton ## stage ## SetShaderWithIfaces(D3D10DDI_HDEVICE, D3D10DDI_HSHADER, UINT, \
+                                                         const UINT *, const D3D11DDIARG_POINTERDATA *)
+TR_DECL_SET_SHADER_WITH_IFACES(Vs); TR_DECL_SET_SHADER_WITH_IFACES(Ps); TR_DECL_SET_SHADER_WITH_IFACES(Gs);
+TR_DECL_SET_SHADER_WITH_IFACES(Hs); TR_DECL_SET_SHADER_WITH_IFACES(Ds); TR_DECL_SET_SHADER_WITH_IFACES(Cs);
+#undef TR_DECL_SET_SHADER_WITH_IFACES
+void   APIENTRY tritonCreateGeometryShader(D3D10DDI_HDEVICE, const UINT *, D3D10DDI_HSHADER, D3D10DDI_HRTSHADER, const VOID *);
+void   APIENTRY tritonCreateHullShader(D3D10DDI_HDEVICE, const UINT *, D3D10DDI_HSHADER, D3D10DDI_HRTSHADER, const VOID *);
+void   APIENTRY tritonCreateDomainShader(D3D10DDI_HDEVICE, const UINT *, D3D10DDI_HSHADER, D3D10DDI_HRTSHADER, const VOID *);
+void   APIENTRY tritonCreateComputeShader(D3D10DDI_HDEVICE, const UINT *, D3D10DDI_HSHADER, D3D10DDI_HRTSHADER);
+SIZE_T APIENTRY tritonCalcPrivateGSWithSOSize(D3D10DDI_HDEVICE, const VOID *);
+void   APIENTRY tritonCreateGSWithSO_11(D3D10DDI_HDEVICE,
+                                        const D3D11DDIARG_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT *, D3D10DDI_HSHADER, D3D10DDI_HRTSHADER, const VOID *);
+
+/* tritonState.c (draw / dispatch / IA buffers) */
+void   APIENTRY tritonIaSetVertexBuffers(D3D10DDI_HDEVICE, UINT, UINT,
+                                         const D3D10DDI_HRESOURCE *,
+                                         const UINT *, const UINT *);
+void   APIENTRY tritonIaSetIndexBuffer(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, DXGI_FORMAT, UINT);
+void   APIENTRY tritonDraw(D3D10DDI_HDEVICE, UINT, UINT);
+void   APIENTRY tritonDrawIndexed(D3D10DDI_HDEVICE, UINT, UINT, INT);
+void   APIENTRY tritonDrawInstanced(D3D10DDI_HDEVICE, UINT, UINT, UINT, UINT);
+void   APIENTRY tritonDrawIndexedInstanced(D3D10DDI_HDEVICE, UINT, UINT, UINT, INT, UINT);
+void   APIENTRY tritonDrawAuto(D3D10DDI_HDEVICE);
+void   APIENTRY tritonDrawInstancedIndirect(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT);
+void   APIENTRY tritonDrawIndexedInstancedIndirect(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT);
+void   APIENTRY tritonGsSetSamplers(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSAMPLER *);
+void   APIENTRY tritonHsSetSamplers(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSAMPLER *);
+void   APIENTRY tritonDsSetSamplers(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSAMPLER *);
+void   APIENTRY tritonCsSetSamplers(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSAMPLER *);
+void   APIENTRY tritonDispatch(D3D10DDI_HDEVICE, UINT, UINT, UINT);
+void   APIENTRY tritonDispatchIndirect(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT);
+void   APIENTRY tritonSoSetTargets(D3D10DDI_HDEVICE, UINT, UINT,
+                                   const D3D10DDI_HRESOURCE *, const UINT *);
+void   APIENTRY tritonSetResourceMinLOD(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, FLOAT);
+
+/* tritonQuery.c */
+SIZE_T APIENTRY tritonCalcPrivateQuerySize(D3D10DDI_HDEVICE, const D3D10DDIARG_CREATEQUERY *);
+void   APIENTRY tritonCreateQuery(D3D10DDI_HDEVICE, const D3D10DDIARG_CREATEQUERY *, D3D10DDI_HQUERY, D3D10DDI_HRTQUERY);
+void   APIENTRY tritonDestroyQuery(D3D10DDI_HDEVICE, D3D10DDI_HQUERY);
+void   APIENTRY tritonQueryBegin(D3D10DDI_HDEVICE, D3D10DDI_HQUERY);
+void   APIENTRY tritonQueryEnd(D3D10DDI_HDEVICE, D3D10DDI_HQUERY);
+void   APIENTRY tritonQueryGetData(D3D10DDI_HDEVICE, D3D10DDI_HQUERY, VOID *, UINT, UINT);
+void   APIENTRY tritonSetPredication(D3D10DDI_HDEVICE, D3D10DDI_HQUERY, BOOL);
+void   APIENTRY tritonCheckFormatSupport(D3D10DDI_HDEVICE, DXGI_FORMAT, UINT *);
+void   APIENTRY tritonCheckMultisampleQualityLevels(D3D10DDI_HDEVICE, DXGI_FORMAT, UINT, UINT *);
+void   APIENTRY tritonCheckCounterInfo(D3D10DDI_HDEVICE, D3D10DDI_COUNTER_INFO *);
+void   APIENTRY tritonCheckCounter(D3D10DDI_HDEVICE, D3D10DDI_QUERY, D3D10DDI_COUNTER_TYPE *,
+                                   UINT *, LPSTR, UINT *, LPSTR, UINT *, LPSTR, UINT *);
+void   APIENTRY tritonDiscard(D3D10DDI_HDEVICE, D3D11DDI_HANDLETYPE, VOID *,
+                              const D3D10_DDI_RECT *, UINT);
+void   APIENTRY tritonClearView(D3D10DDI_HDEVICE, D3D11DDI_HANDLETYPE, VOID *,
+                                const FLOAT[4], const D3D10_DDI_RECT *, UINT);
+void   APIENTRY tritonCheckDirectFlipSupport(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE,
+                                             D3D10DDI_HRESOURCE, UINT, BOOL *);
+void   APIENTRY tritonAssignDebugBinary(D3D10DDI_HDEVICE, D3D10DDI_HSHADER, UINT, const VOID *);
+
+/* tritonQuery.c (WDDM 1.3 / 2.0) */
+void   APIENTRY tritonCheckMultisampleQualityLevels_1_3(D3D10DDI_HDEVICE, DXGI_FORMAT,
+                                                        UINT, UINT, UINT *);
+void   APIENTRY tritonSetMarker(D3D10DDI_HDEVICE);
+void   APIENTRY tritonSetMarkerMode(D3D10DDI_HDEVICE, D3DWDDM1_3DDI_MARKER_TYPE, UINT);
+SIZE_T APIENTRY tritonCalcPrivateQuerySize_WDDM2_0(D3D10DDI_HDEVICE,
+                                                   const D3DWDDM2_0DDIARG_CREATEQUERY *);
+void   APIENTRY tritonCreateQuery_WDDM2_0(D3D10DDI_HDEVICE,
+                                          const D3DWDDM2_0DDIARG_CREATEQUERY *, D3D10DDI_HQUERY, D3D10DDI_HRTQUERY);
+
+/* tritonResource.c (Map / Unmap / copies / hazards / tiled) */
+void   APIENTRY tritonResourceMap(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT,
+                                  D3D10_DDI_MAP, UINT, D3D10DDI_MAPPED_SUBRESOURCE *);
+void   APIENTRY tritonResourceUnmap(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT);
+BOOL   APIENTRY tritonResourceIsStagingBusy(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE);
+void   APIENTRY tritonResourceUpdateSubresourceUP(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE,
+                                                  UINT, const D3D10_DDI_BOX *,
+                                                  const VOID *, UINT, UINT);
+void   APIENTRY tritonResourceUpdateSubresourceUP_11_1(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE,
+                                                       UINT, const D3D10_DDI_BOX *,
+                                                       const VOID *, UINT, UINT, UINT);
+void   APIENTRY tritonResourceCopy(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, D3D10DDI_HRESOURCE);
+void   APIENTRY tritonResourceCopyRegion(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT,
+                                         UINT, UINT, UINT, D3D10DDI_HRESOURCE, UINT,
+                                         const D3D10_DDI_BOX *);
+void   APIENTRY tritonResourceCopyRegion_11_1(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT,
+                                              UINT, UINT, UINT, D3D10DDI_HRESOURCE, UINT,
+                                              const D3D10_DDI_BOX *, UINT);
+void   APIENTRY tritonResourceResolveSubresource(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT, D3D10DDI_HRESOURCE, UINT, DXGI_FORMAT);
+void   APIENTRY tritonResourceReadAfterWriteHazard(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE);
+void   APIENTRY tritonShaderResourceViewReadAfterWriteHazard(D3D10DDI_HDEVICE, D3D10DDI_HSHADERRESOURCEVIEW, D3D10DDI_HRESOURCE);
+
+#define TR_DECL_CB_SETTER_10(stage) \
+    void APIENTRY tritonCs_ ## stage ## _Set10(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HRESOURCE *)
+#define TR_DECL_CB_SETTER_11_1(stage) \
+    void APIENTRY tritonCs_ ## stage ## _Set11_1(D3D10DDI_HDEVICE, UINT, UINT, \
+                                                 const D3D10DDI_HRESOURCE *, const UINT *, const UINT *)
+TR_DECL_CB_SETTER_10(VS); TR_DECL_CB_SETTER_10(PS); TR_DECL_CB_SETTER_10(GS);
+TR_DECL_CB_SETTER_10(HS); TR_DECL_CB_SETTER_10(DS); TR_DECL_CB_SETTER_10(CS);
+TR_DECL_CB_SETTER_11_1(VS); TR_DECL_CB_SETTER_11_1(PS); TR_DECL_CB_SETTER_11_1(GS);
+TR_DECL_CB_SETTER_11_1(HS); TR_DECL_CB_SETTER_11_1(DS); TR_DECL_CB_SETTER_11_1(CS);
+#undef TR_DECL_CB_SETTER_10
+#undef TR_DECL_CB_SETTER_11_1
+
+/* tritonView.c (SRV / DSV / UAV) */
+SIZE_T APIENTRY tritonCalcPrivateSRVSize(D3D10DDI_HDEVICE, const D3D11DDIARG_CREATESHADERRESOURCEVIEW *);
+void   APIENTRY tritonCreateSRV(D3D10DDI_HDEVICE, const D3D11DDIARG_CREATESHADERRESOURCEVIEW *, D3D10DDI_HSHADERRESOURCEVIEW, D3D10DDI_HRTSHADERRESOURCEVIEW);
+void   APIENTRY tritonDestroySRV(D3D10DDI_HDEVICE, D3D10DDI_HSHADERRESOURCEVIEW);
+SIZE_T APIENTRY tritonCalcPrivateDSVSize(D3D10DDI_HDEVICE, const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *);
+void   APIENTRY tritonCreateDSV(D3D10DDI_HDEVICE, const D3D11DDIARG_CREATEDEPTHSTENCILVIEW *, D3D10DDI_HDEPTHSTENCILVIEW, D3D10DDI_HRTDEPTHSTENCILVIEW);
+void   APIENTRY tritonDestroyDSV(D3D10DDI_HDEVICE, D3D10DDI_HDEPTHSTENCILVIEW);
+SIZE_T APIENTRY tritonCalcPrivateUAVSize(D3D10DDI_HDEVICE, const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *);
+void   APIENTRY tritonCreateUAV(D3D10DDI_HDEVICE, const D3D11DDIARG_CREATEUNORDEREDACCESSVIEW *, D3D11DDI_HUNORDEREDACCESSVIEW, D3D11DDI_HRTUNORDEREDACCESSVIEW);
+void   APIENTRY tritonDestroyUAV(D3D10DDI_HDEVICE, D3D11DDI_HUNORDEREDACCESSVIEW);
+void   APIENTRY tritonClearUAVUint(D3D10DDI_HDEVICE, D3D11DDI_HUNORDEREDACCESSVIEW, const UINT[4]);
+void   APIENTRY tritonClearUAVFloat(D3D10DDI_HDEVICE, D3D11DDI_HUNORDEREDACCESSVIEW, const FLOAT[4]);
+void   APIENTRY tritonCopyStructureCount(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT, D3D11DDI_HUNORDEREDACCESSVIEW);
+void   APIENTRY tritonCsSetUAVs(D3D10DDI_HDEVICE, UINT, UINT,
+                                const D3D11DDI_HUNORDEREDACCESSVIEW *, const UINT *);
+void   APIENTRY tritonGenerateMips(D3D10DDI_HDEVICE, D3D10DDI_HSHADERRESOURCEVIEW);
+void   APIENTRY tritonVsSetShaderResources(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSHADERRESOURCEVIEW *);
+void   APIENTRY tritonPsSetShaderResources(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSHADERRESOURCEVIEW *);
+void   APIENTRY tritonGsSetShaderResources(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSHADERRESOURCEVIEW *);
+void   APIENTRY tritonHsSetShaderResources(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSHADERRESOURCEVIEW *);
+void   APIENTRY tritonDsSetShaderResources(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSHADERRESOURCEVIEW *);
+void   APIENTRY tritonCsSetShaderResources(D3D10DDI_HDEVICE, UINT, UINT, const D3D10DDI_HSHADERRESOURCEVIEW *);
+
+/* tritonResource.c (WDDM 1.3 / 2.0 / 2.1) */
+void   APIENTRY tritonGetMipPacking(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT *, UINT *);
+void   APIENTRY tritonGetResourceLayout(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, UINT,
+                                        D3DKMT_HANDLE *, D3DWDDM2_0DDI_TEXTURE_LAYOUT *,
+                                        UINT *, D3DWDDM2_0DDI_SUBRESOURCE_LAYOUT *);
+void   APIENTRY tritonSetHardwareProtection(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, BOOL);
+void   APIENTRY tritonSetHardwareProtectionState(D3D10DDI_HDEVICE, BOOL);
+void   APIENTRY tritonAcquireResource(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, HANDLE);
+void   APIENTRY tritonReleaseResource(D3D10DDI_HDEVICE, D3D10DDI_HRESOURCE, HANDLE);
+
+/* tritonView.c (WDDM 2.0) */
+SIZE_T APIENTRY tritonCalcPrivateSRVSize_WDDM2_0(D3D10DDI_HDEVICE,
+                                                 const D3DWDDM2_0DDIARG_CREATESHADERRESOURCEVIEW *);
+void   APIENTRY tritonCreateSRV_WDDM2_0(D3D10DDI_HDEVICE,
+                                        const D3DWDDM2_0DDIARG_CREATESHADERRESOURCEVIEW *, D3D10DDI_HSHADERRESOURCEVIEW, D3D10DDI_HRTSHADERRESOURCEVIEW);
+SIZE_T APIENTRY tritonCalcPrivateRenderTargetViewSize_WDDM2_0(D3D10DDI_HDEVICE,
+                                                              const D3DWDDM2_0DDIARG_CREATERENDERTARGETVIEW *);
+void   APIENTRY tritonCreateRenderTargetView_WDDM2_0(D3D10DDI_HDEVICE,
+                                                     const D3DWDDM2_0DDIARG_CREATERENDERTARGETVIEW *, D3D10DDI_HRENDERTARGETVIEW, D3D10DDI_HRTRENDERTARGETVIEW);
+SIZE_T APIENTRY tritonCalcPrivateUAVSize_WDDM2_0(D3D10DDI_HDEVICE,
+                                                 const D3DWDDM2_0DDIARG_CREATEUNORDEREDACCESSVIEW *);
+void   APIENTRY tritonCreateUAV_WDDM2_0(D3D10DDI_HDEVICE,
+                                        const D3DWDDM2_0DDIARG_CREATEUNORDEREDACCESSVIEW *, D3D11DDI_HUNORDEREDACCESSVIEW, D3D11DDI_HRTUNORDEREDACCESSVIEW);
+BOOL   APIENTRY tritonFlush_WDDM2_0(D3D10DDI_HDEVICE, UINT, UINT);
+
+/* tritonState.c (WDDM 2.0) */
+SIZE_T APIENTRY tritonCalcPrivateRasterizerStateSize_WDDM2_0(D3D10DDI_HDEVICE,
+                                                             const D3DWDDM2_0DDI_RASTERIZER_DESC *);
+void   APIENTRY tritonCreateRasterizerState_WDDM2_0(D3D10DDI_HDEVICE,
+                                                    const D3DWDDM2_0DDI_RASTERIZER_DESC *, D3D10DDI_HRASTERIZERSTATE, D3D10DDI_HRTRASTERIZERSTATE);
+
+/* tritonShader.c (WDDM 2.0) */
+HRESULT APIENTRY tritonRetrieveShaderComment(D3D10DDI_HDEVICE, D3D10DDI_HSHADER,
+                                             WCHAR *, SIZE_T *);
+
+
+/* ---------- Per-return-type stub helpers ----------
+ *
+ * x64 Windows uses a single calling convention and unused parameters
+ * cost nothing, so a single stub per return type is installed via cast
+ * into every PFND3D... slot of the device function table. TR_STUB logs
+ * the slot once per process. */
+
+static void APIENTRY tritonStubVoid(D3D10DDI_HDEVICE hDevice)
+{
+    (void)hDevice;
+    TR_STUB("Triton<void> stub");
+}
+
+/* GCC's -Wcast-function-type is unhelpful for stub-table population. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wcast-function-type"
+
+#define TR_STUB_V    ((void *)tritonStubVoid)
+
+static void APIENTRY tritonDestroyDevice(D3D10DDI_HDEVICE hDevice);
+
+/* ---------- D3D11_0 device-funcs table ---------- */
+
+static void tritonFillD3D11DeviceFuncs(D3D11DDI_DEVICEFUNCS *p)
+{
+    /* High-frequency */
+    p->pfnDefaultConstantBufferUpdateSubresourceUP  = tritonResourceUpdateSubresourceUP;
+    p->pfnVsSetConstantBuffers                      = tritonCs_VS_Set10;
+    p->pfnPsSetShaderResources                      = tritonPsSetShaderResources;
+    p->pfnPsSetShader                               = tritonPsSetShader;
+    p->pfnPsSetSamplers                             = tritonPsSetSamplers;
+    p->pfnVsSetShader                               = tritonVsSetShader;
+    p->pfnDrawIndexed                               = tritonDrawIndexed;
+    p->pfnDraw                                      = tritonDraw;
+    p->pfnDynamicIABufferMapNoOverwrite             = tritonResourceMap;
+    p->pfnDynamicIABufferUnmap                      = tritonResourceUnmap;
+    p->pfnDynamicConstantBufferMapDiscard           = tritonResourceMap;
+    p->pfnDynamicIABufferMapDiscard                 = tritonResourceMap;
+    p->pfnDynamicConstantBufferUnmap                = tritonResourceUnmap;
+    p->pfnPsSetConstantBuffers                      = tritonCs_PS_Set10;
+    p->pfnIaSetInputLayout                          = tritonIaSetInputLayout;
+    p->pfnIaSetVertexBuffers                        = tritonIaSetVertexBuffers;
+    p->pfnIaSetIndexBuffer                          = tritonIaSetIndexBuffer;
+
+    /* Middle-frequency */
+    p->pfnDrawIndexedInstanced                      = tritonDrawIndexedInstanced;
+    p->pfnDrawInstanced                             = tritonDrawInstanced;
+    p->pfnDynamicResourceMapDiscard                 = tritonResourceMap;
+    p->pfnDynamicResourceUnmap                      = tritonResourceUnmap;
+    p->pfnGsSetConstantBuffers                      = tritonCs_GS_Set10;
+    p->pfnGsSetShader                               = tritonGsSetShader;
+    p->pfnIaSetTopology                             = tritonIaSetTopology;
+    p->pfnStagingResourceMap                        = tritonResourceMap;
+    p->pfnStagingResourceUnmap                      = tritonResourceUnmap;
+    p->pfnVsSetShaderResources                      = tritonVsSetShaderResources;
+    p->pfnVsSetSamplers                             = tritonVsSetSamplers;
+    p->pfnGsSetShaderResources                      = tritonGsSetShaderResources;
+    p->pfnGsSetSamplers                             = tritonGsSetSamplers;
+    p->pfnSetRenderTargets                          = tritonSetRenderTargets;
+    p->pfnShaderResourceViewReadAfterWriteHazard    = tritonShaderResourceViewReadAfterWriteHazard;
+    p->pfnResourceReadAfterWriteHazard              = tritonResourceReadAfterWriteHazard;
+    p->pfnSetBlendState                             = tritonSetBlendState;
+    p->pfnSetDepthStencilState                      = tritonSetDepthStencilState;
+    p->pfnSetRasterizerState                        = tritonSetRasterizerState;
+    p->pfnQueryEnd                                  = tritonQueryEnd;
+    p->pfnQueryBegin                                = tritonQueryBegin;
+    p->pfnResourceCopyRegion                        = tritonResourceCopyRegion;
+    p->pfnResourceUpdateSubresourceUP               = tritonResourceUpdateSubresourceUP;
+    p->pfnSoSetTargets                              = tritonSoSetTargets;
+    p->pfnDrawAuto                                  = tritonDrawAuto;
+    p->pfnSetViewports                              = tritonSetViewports;
+    p->pfnSetScissorRects                           = tritonSetScissorRects;
+    p->pfnClearRenderTargetView                     = tritonClearRenderTargetView;
+    p->pfnClearDepthStencilView                     = tritonClearDepthStencilView;
+    p->pfnSetPredication                            = tritonSetPredication;
+    p->pfnQueryGetData                              = tritonQueryGetData;
+    p->pfnFlush                                     = tritonFlush;
+    p->pfnGenMips                                   = tritonGenerateMips;
+    p->pfnResourceCopy                              = tritonResourceCopy;
+    p->pfnResourceResolveSubresource                = tritonResourceResolveSubresource;
+
+    /* Infrequent */
+    p->pfnResourceMap                               = tritonResourceMap;
+    p->pfnResourceUnmap                             = tritonResourceUnmap;
+    p->pfnResourceIsStagingBusy                     = tritonResourceIsStagingBusy;
+    p->pfnRelocateDeviceFuncs                       = (PFND3D11DDI_RELOCATEDEVICEFUNCS)TR_STUB_V;
+    p->pfnCalcPrivateResourceSize                   = tritonCalcPrivateResourceSize;
+    p->pfnCalcPrivateOpenedResourceSize             = tritonCalcPrivateOpenedResourceSize;
+    p->pfnCreateResource                            = tritonCreateResource;
+    p->pfnOpenResource                              = tritonOpenResource;
+    p->pfnDestroyResource                           = tritonDestroyResource;
+    p->pfnCalcPrivateShaderResourceViewSize         = tritonCalcPrivateSRVSize;
+    p->pfnCreateShaderResourceView                  = tritonCreateSRV;
+    p->pfnDestroyShaderResourceView                 = tritonDestroySRV;
+    p->pfnCalcPrivateRenderTargetViewSize           = tritonCalcPrivateRenderTargetViewSize;
+    p->pfnCreateRenderTargetView                    = tritonCreateRenderTargetView;
+    p->pfnDestroyRenderTargetView                   = tritonDestroyRenderTargetView;
+    p->pfnCalcPrivateDepthStencilViewSize           = tritonCalcPrivateDSVSize;
+    p->pfnCreateDepthStencilView                    = tritonCreateDSV;
+    p->pfnDestroyDepthStencilView                   = tritonDestroyDSV;
+    p->pfnCalcPrivateElementLayoutSize              = tritonCalcPrivateElementLayoutSize;
+    p->pfnCreateElementLayout                       = tritonCreateElementLayout;
+    p->pfnDestroyElementLayout                      = tritonDestroyElementLayout;
+    /* The 11.0 table uses the D3D10.1 blend desc (no LogicOp).
+     * tritonCreateBlendState_10 upgrades to the 11.1 form. */
+    p->pfnCalcPrivateBlendStateSize                 = tritonCalcPrivateBlendStateSize_10;
+    p->pfnCreateBlendState                          = tritonCreateBlendState_10;
+    p->pfnDestroyBlendState                         = tritonDestroyBlendState;
+    p->pfnCalcPrivateDepthStencilStateSize          = tritonCalcPrivateDepthStencilStateSize;
+    p->pfnCreateDepthStencilState                   = tritonCreateDepthStencilState;
+    p->pfnDestroyDepthStencilState                  = tritonDestroyDepthStencilState;
+    /* The 11.0 table uses the D3D10.0 rasterizer desc (no
+     * ForcedSampleCount). _10 upgrades and delegates to the 11.1 path. */
+    p->pfnCalcPrivateRasterizerStateSize            = tritonCalcPrivateRasterizerStateSize_10;
+    p->pfnCreateRasterizerState                     = tritonCreateRasterizerState_10;
+    p->pfnDestroyRasterizerState                    = tritonDestroyRasterizerState;
+    p->pfnCalcPrivateShaderSize                     = (PFND3D10DDI_CALCPRIVATESHADERSIZE)tritonCalcPrivateShaderSize;
+    p->pfnCreateVertexShader                        = (PFND3D10DDI_CREATEVERTEXSHADER)tritonCreateVertexShader;
+    p->pfnCreateGeometryShader                      = (PFND3D10DDI_CREATEGEOMETRYSHADER)tritonCreateGeometryShader;
+    p->pfnCreatePixelShader                         = (PFND3D10DDI_CREATEPIXELSHADER)tritonCreatePixelShader;
+    p->pfnCalcPrivateGeometryShaderWithStreamOutput = (PFND3D11DDI_CALCPRIVATEGEOMETRYSHADERWITHSTREAMOUTPUT)tritonCalcPrivateGSWithSOSize;
+    p->pfnCreateGeometryShaderWithStreamOutput      = (PFND3D11DDI_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT)tritonCreateGSWithSO_11;
+    p->pfnDestroyShader                             = tritonDestroyShader;
+    p->pfnCalcPrivateSamplerSize                    = tritonCalcPrivateSamplerSize;
+    p->pfnCreateSampler                             = tritonCreateSampler;
+    p->pfnDestroySampler                            = tritonDestroySampler;
+    p->pfnCalcPrivateQuerySize                      = tritonCalcPrivateQuerySize;
+    p->pfnCreateQuery                               = tritonCreateQuery;
+    p->pfnDestroyQuery                              = tritonDestroyQuery;
+
+    p->pfnCheckFormatSupport                        = tritonCheckFormatSupport;
+    p->pfnCheckMultisampleQualityLevels             = tritonCheckMultisampleQualityLevels;
+    p->pfnCheckCounterInfo                          = tritonCheckCounterInfo;
+    p->pfnCheckCounter                              = tritonCheckCounter;
+
+    p->pfnDestroyDevice                             = tritonDestroyDevice;
+    p->pfnSetTextFilterSize                         = (PFND3D10DDI_SETTEXTFILTERSIZE)TR_STUB_V;
+
+    /* 10.1 entries */
+    /* The runtime routes copies between a packed or block-compressed format
+     * and its same-size uncompressed twin (R9G9B9E5 <-> R32_UINT, BC1 <->
+     * R32G32_UINT, ...) through these instead of ResourceCopy; D3D11 on the
+     * host performs the reinterpretation, so they are the same copies. */
+    p->pfnResourceConvert                           = tritonResourceCopy;
+    p->pfnResourceConvertRegion                     = tritonResourceCopyRegion;
+
+    /* 11.0 entries */
+    p->pfnDrawIndexedInstancedIndirect              = tritonDrawIndexedInstancedIndirect;
+    p->pfnDrawInstancedIndirect                     = tritonDrawInstancedIndirect;
+    p->pfnCommandListExecute                        = (PFND3D11DDI_COMMANDLISTEXECUTE)0;
+    p->pfnHsSetShaderResources                      = tritonHsSetShaderResources;
+    p->pfnHsSetShader                               = tritonHsSetShader;
+    p->pfnHsSetSamplers                             = tritonHsSetSamplers;
+    p->pfnHsSetConstantBuffers                      = tritonCs_HS_Set10;
+    p->pfnDsSetShaderResources                      = tritonDsSetShaderResources;
+    p->pfnDsSetShader                               = tritonDsSetShader;
+    p->pfnDsSetSamplers                             = tritonDsSetSamplers;
+    p->pfnDsSetConstantBuffers                      = tritonCs_DS_Set10;
+    p->pfnCreateHullShader                          = (PFND3D11DDI_CREATEHULLSHADER)tritonCreateHullShader;
+    p->pfnCreateDomainShader                        = (PFND3D11DDI_CREATEDOMAINSHADER)tritonCreateDomainShader;
+    p->pfnCheckDeferredContextHandleSizes           = (PFND3D11DDI_CHECKDEFERREDCONTEXTHANDLESIZES)0;
+    p->pfnCalcDeferredContextHandleSize             = (PFND3D11DDI_CALCDEFERREDCONTEXTHANDLESIZE)0;
+    p->pfnCalcPrivateDeferredContextSize            = (PFND3D11DDI_CALCPRIVATEDEFERREDCONTEXTSIZE)0;
+    p->pfnCreateDeferredContext                     = (PFND3D11DDI_CREATEDEFERREDCONTEXT)0;
+    p->pfnAbandonCommandList                        = (PFND3D11DDI_ABANDONCOMMANDLIST)0;
+    p->pfnCalcPrivateCommandListSize                = (PFND3D11DDI_CALCPRIVATECOMMANDLISTSIZE)0;
+    p->pfnCreateCommandList                         = (PFND3D11DDI_CREATECOMMANDLIST)0;
+    p->pfnDestroyCommandList                        = (PFND3D11DDI_DESTROYCOMMANDLIST)0;
+    p->pfnCalcPrivateTessellationShaderSize         = (PFND3D11DDI_CALCPRIVATETESSELLATIONSHADERSIZE)tritonCalcPrivateTessellationShaderSize;
+    p->pfnPsSetShaderWithIfaces                     = tritonPsSetShaderWithIfaces;
+    p->pfnVsSetShaderWithIfaces                     = tritonVsSetShaderWithIfaces;
+    p->pfnGsSetShaderWithIfaces                     = tritonGsSetShaderWithIfaces;
+    p->pfnHsSetShaderWithIfaces                     = tritonHsSetShaderWithIfaces;
+    p->pfnDsSetShaderWithIfaces                     = tritonDsSetShaderWithIfaces;
+    p->pfnCsSetShaderWithIfaces                     = tritonCsSetShaderWithIfaces;
+    p->pfnCreateComputeShader                       = tritonCreateComputeShader;
+    p->pfnCsSetShader                               = tritonCsSetShader;
+    p->pfnCsSetShaderResources                      = tritonCsSetShaderResources;
+    p->pfnCsSetSamplers                             = tritonCsSetSamplers;
+    p->pfnCsSetConstantBuffers                      = tritonCs_CS_Set10;
+    p->pfnCalcPrivateUnorderedAccessViewSize        = tritonCalcPrivateUAVSize;
+    p->pfnCreateUnorderedAccessView                 = tritonCreateUAV;
+    p->pfnDestroyUnorderedAccessView                = tritonDestroyUAV;
+    p->pfnClearUnorderedAccessViewUint              = tritonClearUAVUint;
+    p->pfnClearUnorderedAccessViewFloat             = tritonClearUAVFloat;
+    p->pfnCsSetUnorderedAccessViews                 = tritonCsSetUAVs;
+    p->pfnDispatch                                  = tritonDispatch;
+    p->pfnDispatchIndirect                          = tritonDispatchIndirect;
+    p->pfnSetResourceMinLOD                         = tritonSetResourceMinLOD;
+    p->pfnCopyStructureCount                        = tritonCopyStructureCount;
+    p->pfnRecycleCommandList                        = (PFND3D11DDI_RECYCLECOMMANDLIST)0;
+    p->pfnRecycleCreateCommandList                  = (PFND3D11DDI_RECYCLECREATECOMMANDLIST)0;
+    p->pfnRecycleCreateDeferredContext              = (PFND3D11DDI_RECYCLECREATEDEFERREDCONTEXT)0;
+    p->pfnRecycleDestroyCommandList                 = (PFND3D11DDI_DESTROYCOMMANDLIST)0;
+}
+
+/* ---------- D3D11_1 device-funcs table ---------- */
+
+static void tritonFillD3D11_1DeviceFuncs(D3D11_1DDI_DEVICEFUNCS *p)
+{
+    /* D3D11_1DDI_DEVICEFUNCS starts with the same layout as
+     * D3D11DDI_DEVICEFUNCS for the shared prefix; install the 11.0
+     * fillers via cast, then override the 11.1-specific slots. */
+    tritonFillD3D11DeviceFuncs((D3D11DDI_DEVICEFUNCS *)(p));
+
+    p->pfnDefaultConstantBufferUpdateSubresourceUP  = tritonResourceUpdateSubresourceUP_11_1;
+    p->pfnVsSetConstantBuffers                      = tritonCs_VS_Set11_1;
+    p->pfnPsSetConstantBuffers                      = tritonCs_PS_Set11_1;
+    p->pfnGsSetConstantBuffers                      = tritonCs_GS_Set11_1;
+    p->pfnHsSetConstantBuffers                      = tritonCs_HS_Set11_1;
+    p->pfnDsSetConstantBuffers                      = tritonCs_DS_Set11_1;
+    p->pfnCsSetConstantBuffers                      = tritonCs_CS_Set11_1;
+    p->pfnResourceCopyRegion                        = tritonResourceCopyRegion_11_1;
+    /* From the 11.1 funcs on, pfnResourceConvertRegion is the CopyFlags-
+     * taking PFND3D11_1DDI_RESOURCECOPYREGION as well. */
+    p->pfnResourceConvertRegion                     = tritonResourceCopyRegion_11_1;
+    p->pfnResourceUpdateSubresourceUP               = tritonResourceUpdateSubresourceUP_11_1;
+    p->pfnFlush                                     = tritonFlush11_1;
+    p->pfnCalcPrivateBlendStateSize                 = tritonCalcPrivateBlendStateSize;
+    p->pfnCreateBlendState                          = tritonCreateBlendState;
+    p->pfnCalcPrivateRasterizerStateSize            = tritonCalcPrivateRasterizerStateSize;
+    p->pfnCreateRasterizerState                     = tritonCreateRasterizerState;
+    p->pfnCalcPrivateShaderSize                     = (PFND3D11_1DDI_CALCPRIVATESHADERSIZE)tritonCalcPrivateShaderSize;
+    p->pfnCreateVertexShader                        = (PFND3D11_1DDI_CREATEVERTEXSHADER)tritonCreateVertexShader;
+    p->pfnCreateGeometryShader                      = (PFND3D11_1DDI_CREATEGEOMETRYSHADER)tritonCreateGeometryShader;
+    p->pfnCreatePixelShader                         = (PFND3D11_1DDI_CREATEPIXELSHADER)tritonCreatePixelShader;
+    p->pfnCalcPrivateGeometryShaderWithStreamOutput = (PFND3D11_1DDI_CALCPRIVATEGEOMETRYSHADERWITHSTREAMOUTPUT)tritonCalcPrivateGSWithSOSize;
+    p->pfnCreateGeometryShaderWithStreamOutput      = (PFND3D11_1DDI_CREATEGEOMETRYSHADERWITHSTREAMOUTPUT)tritonCreateGSWithSO_11;
+    p->pfnCreateHullShader                          = (PFND3D11_1DDI_CREATEHULLSHADER)tritonCreateHullShader;
+    p->pfnCreateDomainShader                        = (PFND3D11_1DDI_CREATEDOMAINSHADER)tritonCreateDomainShader;
+    p->pfnCalcPrivateTessellationShaderSize         = (PFND3D11_1DDI_CALCPRIVATETESSELLATIONSHADERSIZE)tritonCalcPrivateTessellationShaderSize;
+
+    /* 11.1-only slots. */
+    p->pfnDiscard                                   = tritonDiscard;
+    p->pfnAssignDebugBinary                         = tritonAssignDebugBinary;
+    p->pfnDynamicConstantBufferMapNoOverwrite       = tritonResourceMap;
+    p->pfnCheckDirectFlipSupport                    = tritonCheckDirectFlipSupport;
+    p->pfnClearView                                 = tritonClearView;
+}
+
+/* ---------- WDDM 1.3 device-funcs table ----------
+ *
+ * Same layout as 11.1 for every shared field. Differences:
+ *   - pfnRelocateDeviceFuncs has a tier-specific PFN type.
+ *   - pfnCheckMultisampleQualityLevels gains a Flags parameter.
+ *   - Nine new tiled-resource + marker entrypoints appended. */
+
+static void tritonFillWDDM1_3DeviceFuncs(D3DWDDM1_3DDI_DEVICEFUNCS *p)
+{
+    tritonFillD3D11_1DeviceFuncs((D3D11_1DDI_DEVICEFUNCS *)(p));
+
+    p->pfnRelocateDeviceFuncs           = (PFND3DWDDM1_3DDI_RELOCATEDEVICEFUNCS)TR_STUB_V;
+    p->pfnCheckMultisampleQualityLevels = tritonCheckMultisampleQualityLevels_1_3;
+
+    p->pfnUpdateTileMappings   = (PFND3DWDDM1_3DDI_UPDATETILEMAPPINGS)TR_STUB_V;
+    p->pfnCopyTileMappings     = (PFND3DWDDM1_3DDI_COPYTILEMAPPINGS)TR_STUB_V;
+    p->pfnCopyTiles            = (PFND3DWDDM1_3DDI_COPYTILES)TR_STUB_V;
+    p->pfnUpdateTiles          = (PFND3DWDDM1_3DDI_UPDATETILES)TR_STUB_V;
+    p->pfnTiledResourceBarrier = (PFND3DWDDM1_3DDI_TILEDRESOURCEBARRIER)TR_STUB_V;
+    p->pfnGetMipPacking        = tritonGetMipPacking;
+    p->pfnResizeTilePool       = (PFND3DWDDM1_3DDI_RESIZETILEPOOL)TR_STUB_V;
+    p->pfnSetMarker            = tritonSetMarker;
+    p->pfnSetMarkerMode        = tritonSetMarkerMode;
+}
+
+/* ---------- WDDM 2.0 device-funcs table ----------
+ *
+ * Shares field NAMES with 11.0/11.1 for most create-* entrypoints, but
+ * the PFN types are wider (PlaneSlice in view ARGs; ContextType in
+ * pfnFlush; new ARG types for query / UAV / rasterizer). The 11.1
+ * chain-call writes 11.x-typed pointers; we overwrite them here. */
+
+static void tritonFillWDDM2_0DeviceFuncs(D3DWDDM2_0DDI_DEVICEFUNCS *p)
+{
+    tritonFillWDDM1_3DeviceFuncs((D3DWDDM1_3DDI_DEVICEFUNCS *)(p));
+
+    p->pfnRelocateDeviceFuncs                   = (PFND3DWDDM2_0DDI_RELOCATEDEVICEFUNCS)TR_STUB_V;
+
+    p->pfnCalcPrivateShaderResourceViewSize     = tritonCalcPrivateSRVSize_WDDM2_0;
+    p->pfnCreateShaderResourceView              = tritonCreateSRV_WDDM2_0;
+    p->pfnCalcPrivateRenderTargetViewSize       = tritonCalcPrivateRenderTargetViewSize_WDDM2_0;
+    p->pfnCreateRenderTargetView                = tritonCreateRenderTargetView_WDDM2_0;
+    p->pfnCalcPrivateRasterizerStateSize        = tritonCalcPrivateRasterizerStateSize_WDDM2_0;
+    p->pfnCreateRasterizerState                 = tritonCreateRasterizerState_WDDM2_0;
+    p->pfnCalcPrivateQuerySize                  = tritonCalcPrivateQuerySize_WDDM2_0;
+    p->pfnCreateQuery                           = tritonCreateQuery_WDDM2_0;
+    p->pfnCalcPrivateUnorderedAccessViewSize    = tritonCalcPrivateUAVSize_WDDM2_0;
+    p->pfnCreateUnorderedAccessView             = tritonCreateUAV_WDDM2_0;
+    p->pfnFlush                                 = tritonFlush_WDDM2_0;
+
+    /* RetrieveShaderComment + SetHardwareProtectionState were retro-added
+     * to the WDDM 2.0 struct at MINOR_HEADER_VERSION >= 9. */
+    p->pfnSetHardwareProtection      = tritonSetHardwareProtection;
+    p->pfnGetResourceLayout          = tritonGetResourceLayout;
+    p->pfnRetrieveShaderComment      = tritonRetrieveShaderComment;
+    p->pfnSetHardwareProtectionState = tritonSetHardwareProtectionState;
+}
+
+/* ---------- WDDM 2.1 device-funcs table ----------
+ *
+ * WDDM 2.0 + Acquire/ReleaseResource sync-token entrypoints. */
+
+static void tritonFillWDDM2_1DeviceFuncs(D3DWDDM2_1DDI_DEVICEFUNCS *p)
+{
+    tritonFillWDDM2_0DeviceFuncs((D3DWDDM2_0DDI_DEVICEFUNCS *)(p));
+
+    p->pfnRelocateDeviceFuncs = (PFND3DWDDM2_1DDI_RELOCATEDEVICEFUNCS)TR_STUB_V;
+    p->pfnAcquireResource     = (PFND3DWDDM2_1DDI_SYNC_TOKEN)tritonAcquireResource;
+    p->pfnReleaseResource     = (PFND3DWDDM2_1DDI_SYNC_TOKEN)tritonReleaseResource;
+}
+
+/* WDDM 2.2 shader-cache-session stubs.  The runtime only drives these when
+ * the driver requests a runtime cache (D3DWDDM2_2DDICAPS_SHADERCACHE,
+ * answered FALSE -- compilation happens host-side and both backends keep
+ * their own caches), but the entries must be callable-safe regardless. */
+static SIZE_T APIENTRY tritonCalcPrivateShaderCacheSessionSize(D3D10DDI_HDEVICE hDevice)
+{
+    (void)hDevice;
+    return sizeof(void *); /* smallest non-zero private size */
+}
+
+static VOID APIENTRY tritonCreateShaderCacheSession(D3D10DDI_HDEVICE hDevice,
+                                                    D3DWDDM2_2DDI_HCACHESESSION hSession,
+                                                    D3DWDDM2_2DDI_HRTCACHESESSION hRTSession)
+{
+    (void)hDevice; (void)hSession; (void)hRTSession;
+}
+
+static VOID APIENTRY tritonDestroyShaderCacheSession(D3D10DDI_HDEVICE hDevice,
+                                                     D3DWDDM2_2DDI_HCACHESESSION hSession)
+{
+    (void)hDevice; (void)hSession;
+}
+
+static VOID APIENTRY tritonSetShaderCacheSession(D3D10DDI_HDEVICE hDevice,
+                                                 D3DWDDM2_2DDI_HCACHESESSION hSession)
+{
+    (void)hDevice; (void)hSession;
+}
+
+/* The 2.2 struct is the 2.1 layout with pfnRelocateDeviceFuncs retyped and
+ * the four shader-cache-session entries appended. */
+static void tritonFillWDDM2_2DeviceFuncs(D3DWDDM2_2DDI_DEVICEFUNCS *p)
+{
+    tritonFillWDDM2_1DeviceFuncs((D3DWDDM2_1DDI_DEVICEFUNCS *)(p));
+
+    p->pfnRelocateDeviceFuncs = (PFND3DWDDM2_2DDI_RELOCATEDEVICEFUNCS)TR_STUB_V;
+    p->pfnCalcPrivateShaderCacheSessionSize = tritonCalcPrivateShaderCacheSessionSize;
+    p->pfnCreateShaderCacheSession          = tritonCreateShaderCacheSession;
+    p->pfnDestroyShaderCacheSession         = tritonDestroyShaderCacheSession;
+    p->pfnSetShaderCacheSession             = tritonSetShaderCacheSession;
+}
+
+/* ---------- DestroyDevice ---------- */
+
+static void APIENTRY tritonDestroyDevice(D3D10DDI_HDEVICE hDevice)
+{
+    PTRITON_DEVICE p = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
+    if (!p) {
+        TR_LOG("DestroyDevice: hDevice has no driver private");
+        return;
+    }
+    /* Wait out any present still in flight (see presentInFlight in triton.h)
+     * BEFORE touching anything it uses.  The DDI gives no guarantee that a
+     * present has retired by DestroyDevice, and everything below -- the
+     * context flush, the kernel-context destroy, the object releases and the
+     * critical-section deletes -- tears out state a running present holds.
+     *
+     * The present gate's own wait is bounded, so this normally terminates
+     * quickly.  The deadline exceeds that bound and is a canary for what the
+     * bound does not cover -- a stuck pfnPresentCb or an unbalanced counter --
+     * which would otherwise spin here forever with no diagnostic.
+     *
+     * On expiry there is no safe action left.  The runtime frees this private
+     * device block as soon as DestroyDevice returns, and presentLock,
+     * kmCtxLock and presentInFlight all live inside it, so skipping the
+     * teardown does not keep a stuck present's state valid -- it only avoids
+     * compounding the fault with a release the present is actively using.
+     * Return without tearing down and report it. */
+    {
+        const ULONGLONG drain_deadline =
+            GetTickCount64() + TRITON_PRESENT_DRAIN_MS;
+        BOOL drained = TRUE;
+        while (InterlockedCompareExchange(&p->presentInFlight, 0, 0) != 0) {
+            if (GetTickCount64() >= drain_deadline) { drained = FALSE; break; }
+            Sleep(1);
+        }
+        if (!drained) {
+            npt_log("triton: DestroyDevice: presentInFlight still %ld after "
+                    "%u ms -- skipping teardown. A present is genuinely stuck, "
+                    "or the counter is unbalanced; the runtime frees this "
+                    "device block on return either way.",
+                    (long)InterlockedCompareExchange(&p->presentInFlight, 0, 0),
+                    (unsigned)TRITON_PRESENT_DRAIN_MS);
+            p->pAdapter = NULL;
+            return;
+        }
+    }
+
+    if (p->pCtx1)
+        ID3D11DeviceContext1_Flush(p->pCtx1);
+    /* Tear down the present kernel context before the device goes away, under
+     * the HCONTEXT-domain lock (see kmCtxLock in triton.h) so it cannot run
+     * against a pfnPresentCb on the same handle. */
+    if (p->hKMContext && p->KTCallbacks.pfnDestroyContextCb) {
+        D3DDDICB_DESTROYCONTEXT dc;
+        memset(&dc, 0, sizeof(dc));
+        dc.hContext = p->hKMContext;
+        if (p->presentLockInit)
+            EnterCriticalSection(&p->kmCtxLock);
+        p->KTCallbacks.pfnDestroyContextCb(p->hRTDevice.handle, &dc);
+        p->hKMContext = NULL;
+        if (p->presentLockInit)
+            LeaveCriticalSection(&p->kmCtxLock);
+    }
+
+    /* The residency requests the paging queue granted die with this
+     * device's allocations. */
+    tritonKmDestroy(&p->Km);
+
+    /* Release the lazily-created present-fence objects under presentLock,
+     * marking the fence not-ready+disabled first so a present still inside
+     * the fence protocol falls back to unfenced instead of reviving a
+     * torn-down object. */
+    if (p->presentLockInit) {
+        EnterCriticalSection(&p->presentLock);
+        p->presentFenceReady    = FALSE;
+        p->presentFenceDisabled = TRUE;
+        if (p->pPresentFence) { ID3D11Fence_Release(p->pPresentFence);  p->pPresentFence = NULL; }
+        if (p->pCtx4)         { ID3D11DeviceContext4_Release(p->pCtx4); p->pCtx4 = NULL; }
+        if (p->pBlitVS)      { ID3D11VertexShader_Release(p->pBlitVS);      p->pBlitVS = NULL; }
+        if (p->pBlitPS)      { ID3D11PixelShader_Release(p->pBlitPS);       p->pBlitPS = NULL; }
+        if (p->pBlitSampler) { ID3D11SamplerState_Release(p->pBlitSampler); p->pBlitSampler = NULL; }
+        if (p->pBlitCB)      { ID3D11Buffer_Release(p->pBlitCB);            p->pBlitCB = NULL; }
+        /* Drop the pooled events without closing them.  A pooled event can
+         * still carry an outstanding arm: SetEventOnCompletion is serviced by
+         * npt_event's waiter thread, which belongs to the process-wide device
+         * singleton and outlives this Triton device, and releasing the fence
+         * does not reach it.  Closing the handle would let that waiter signal
+         * whatever object later inherits the handle value.  The leak is
+         * bounded to TRITON_PRESENT_EVENT_POOL handles per device teardown. */
+        p->presentEventPoolCount = 0;
+        LeaveCriticalSection(&p->presentLock);
+        DeleteCriticalSection(&p->presentLock);
+        DeleteCriticalSection(&p->kmCtxLock);
+        p->presentLockInit = FALSE;
+    }
+    if (p->pCtx3) { ID3D11DeviceContext3_Release(p->pCtx3); p->pCtx3 = NULL; }
+    if (p->pCtx1) { ID3D11DeviceContext1_Release(p->pCtx1); p->pCtx1 = NULL; }
+    if (p->pDev3) { ID3D11Device3_Release(p->pDev3);        p->pDev3 = NULL; }
+    if (p->pDev1) { ID3D11Device1_Release(p->pDev1);        p->pDev1 = NULL; }
+    /* The runtime owns the TRITON_DEVICE memory (allocated via
+     * pfnCalcPrivateDeviceSize); just clear the back-pointer. */
+    p->pAdapter = NULL;
+    TR_LOG("DestroyDevice");
+}
+
+/* ---------- pfnCreateDevice ---------- */
+
+static HRESULT APIENTRY tritonCreateDevice(D3D10DDI_HADAPTER hAdapter,
+                                           D3D10DDIARG_CREATEDEVICE *pArgs)
+{
+    PTRITON_ADAPTER pAdapter = (PTRITON_ADAPTER)(hAdapter.pDrvPrivate);
+    PTRITON_DEVICE  p        = (PTRITON_DEVICE)(pArgs->hDrvDevice.pDrvPrivate);
+    if (!pAdapter || !p) {
+        TR_LOG("CreateDevice: missing pDrvPrivate (adapter=%p, device=%p)",
+               (void *)pAdapter, (void *)p);
+        return E_INVALIDARG;
+    }
+
+    /* Zero the private block before touching anything.  The runtime allocates
+     * it from the size returned by pfnCalcPrivateDeviceSize, guarantees
+     * nothing about its contents, and recycles it across Create/Destroy within
+     * a process, so any field the assignments below miss would arrive holding
+     * the previous device's value.  Zeroing makes "every field is initialised"
+     * true by construction instead of by keeping that list in sync with the
+     * struct, and is safe because this is opaque driver-owned storage that
+     * nothing reads a pre-existing value out of. */
+    memset(p, 0, sizeof(*p));
+
+    TR_LOG("CreateDevice: Interface=0x%08x Version=0x%08x Flags=0x%08x",
+           pArgs->Interface, pArgs->Version, pArgs->Flags);
+
+    /* Install the device-funcs table for the requested interface.
+     * Higher-tier fillers chain-call the lower-tier ones. */
+    switch (pArgs->Interface) {
+    case D3D11_0_DDI_INTERFACE_VERSION:
+        tritonFillD3D11DeviceFuncs(pArgs->p11DeviceFuncs);
+        break;
+    case D3D11_1_DDI_INTERFACE_VERSION:
+        tritonFillD3D11_1DeviceFuncs(pArgs->p11_1DeviceFuncs);
+        break;
+    case D3DWDDM1_3_DDI_INTERFACE_VERSION:
+        tritonFillWDDM1_3DeviceFuncs(pArgs->pWDDM1_3DeviceFuncs);
+        break;
+    case D3DWDDM2_0_DDI_INTERFACE_VERSION:
+        tritonFillWDDM2_0DeviceFuncs(pArgs->pWDDM2_0DeviceFuncs);
+        break;
+    case D3DWDDM2_1_DDI_INTERFACE_VERSION:
+        tritonFillWDDM2_1DeviceFuncs(pArgs->pWDDM2_1DeviceFuncs);
+        break;
+    case D3DWDDM2_2_DDI_INTERFACE_VERSION:
+    case D3DWDDM2_3_DDI_INTERFACE_VERSION:
+        /* 2.3 has no device-funcs struct of its own -- the
+         * D3D10DDIARG_CREATEDEVICE union goes straight from
+         * pWDDM2_2DeviceFuncs to pWDDM2_6DeviceFuncs. */
+        tritonFillWDDM2_2DeviceFuncs(pArgs->pWDDM2_2DeviceFuncs);
+        break;
+    default:
+        TR_LOG("CreateDevice: unsupported interface 0x%08x", pArgs->Interface);
+        return E_FAIL;
+    }
+
+    p->hRTDevice    = pArgs->hRTDevice;
+    p->uIfVersion   = pArgs->Interface;
+    p->pAdapter     = pAdapter;
+    p->KTCallbacks  = *pArgs->pKTCallbacks;
+    tritonKmInit(&p->Km, pAdapter->hRTAdapter.handle, pArgs->hRTDevice.handle,
+                 &p->KTCallbacks);
+    p->hRTCoreLayer   = pArgs->hRTCoreLayer;
+    /* The CREATEDEVICE callbacks are a union: every member aliases the
+     * same pointer. Every D3D*DDI_CORELAYER_DEVICECALLBACKS version shares
+     * pfnSetErrorCb as its first field, and the pfnState*Cb slots follow at
+     * the same offsets in each, so reading through the 11.0-typed member is
+     * correct for every tier tritonCreateDevice accepts. */
+    p->pUMCallbacks   = pArgs->p11UMCallbacks;
+
+    /* The runtime encodes the requested pipeline level in pArgs->Flags
+     * (per D3D11DDICAPS_3DPIPELINESUPPORT). Accept the full 10.0..11.1
+     * range advertised by GetCaps; the host creates a device clamped to
+     * the requested feature level. */
+    const D3D11DDI_3DPIPELINELEVEL level =
+        D3D11DDI_EXTRACT_3DPIPELINELEVEL_FROM_FLAGS(pArgs->Flags);
+    D3D_FEATURE_LEVEL requested;
+    switch (level) {
+    case D3D11DDI_3DPIPELINELEVEL_10_0:    requested = D3D_FEATURE_LEVEL_10_0; break;
+    case D3D11DDI_3DPIPELINELEVEL_10_1:    requested = D3D_FEATURE_LEVEL_10_1; break;
+    case D3D11DDI_3DPIPELINELEVEL_11_0:    requested = D3D_FEATURE_LEVEL_11_0; break;
+    case D3D11_1DDI_3DPIPELINELEVEL_11_1:  requested = D3D_FEATURE_LEVEL_11_1; break;
+    default:
+        TR_LOG("CreateDevice: pipeline level %d unsupported (Triton requires >= 10.0; Flags=0x%08x)",
+               level, pArgs->Flags);
+        return E_FAIL;
+    }
+
+    /* Statically-linked internal factory.  Returns the base
+     * ID3D11Device + ID3D11DeviceContext; QI down to the Tier 1 forms
+     * Triton works with. */
+    ID3D11Device        *raw_dev = NULL;
+    ID3D11DeviceContext *raw_ctx = NULL;
+    HRESULT hr = S_OK;
+    D3D_FEATURE_LEVEL hostLevel = requested;
+    /* The caps snapshot (GetCaps) already stood up a device at the
+     * host's highest level; adopt it when it covers the requested level
+     * rather than create a second host device.  A later CreateDevice on
+     * the same adapter creates its own. */
+    if (pAdapter->pCapsDev && requested <= pAdapter->CapsFeatureLevel) {
+        raw_dev = (ID3D11Device *)InterlockedExchangePointer(
+            (PVOID volatile *)&pAdapter->pCapsDev, NULL);
+        if (raw_dev) {
+            raw_ctx = (ID3D11DeviceContext *)InterlockedExchangePointer(
+                (PVOID volatile *)&pAdapter->pCapsCtx, NULL);
+            hostLevel = pAdapter->CapsFeatureLevel;
+            TR_LOG("CreateDevice: adopting the caps-snapshot device (%p, host fl 0x%x)",
+                   (void *)raw_dev, (unsigned)pAdapter->CapsFeatureLevel);
+        }
+    }
+    if (!raw_dev)
+        hr = npt_d3d11_create_device_internal(
+            NULL /* pAdapter */, D3D_DRIVER_TYPE_HARDWARE, NULL,
+            0 /* Flags */, &requested, 1, D3D11_SDK_VERSION,
+            &raw_dev, &hostLevel, &raw_ctx);
+    if (FAILED(hr) || !raw_dev || !raw_ctx) {
+        TR_LOG("CreateDevice: npt_d3d11_create_device_internal failed 0x%08lx", hr);
+        if (raw_dev) ID3D11Device_Release(raw_dev);
+        if (raw_ctx) ID3D11DeviceContext_Release(raw_ctx);
+        return FAILED(hr) ? hr : E_FAIL;
+    }
+    hr = ID3D11Device_QueryInterface(raw_dev, &IID_ID3D11Device1,
+                                     (void **)&p->pDev1);
+    ID3D11Device_Release(raw_dev);
+    if (FAILED(hr) || !p->pDev1) {
+        TR_LOG("CreateDevice: QI ID3D11Device1 failed 0x%08lx", hr);
+        ID3D11DeviceContext_Release(raw_ctx);
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+    }
+    hr = ID3D11DeviceContext_QueryInterface(raw_ctx, &IID_ID3D11DeviceContext1,
+                                            (void **)&p->pCtx1);
+    ID3D11DeviceContext_Release(raw_ctx);
+    if (FAILED(hr) || !p->pCtx1) {
+        TR_LOG("CreateDevice: QI ID3D11DeviceContext1 failed 0x%08lx", hr);
+        ID3D11Device1_Release(p->pDev1); p->pDev1 = NULL;
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+    }
+    TR_LOG("CreateDevice: got Neptune device, requested level 0x%x, host level 0x%x",
+           (unsigned)requested, (unsigned)hostLevel);
+
+    /* QI for the 11.3 interfaces the WDDM 2.0 handlers forward to. NULL
+     * is non-fatal: those handlers fall back to the 11.1 forms. */
+    if (FAILED(ID3D11Device1_QueryInterface(p->pDev1, &IID_ID3D11Device3,
+                                            (void **)&p->pDev3)))
+        p->pDev3 = NULL;
+    if (FAILED(ID3D11DeviceContext1_QueryInterface(p->pCtx1, &IID_ID3D11DeviceContext3,
+                                                   (void **)&p->pCtx3)))
+        p->pCtx3 = NULL;
+    TR_LOG("CreateDevice: Neptune interface tier: Device3=%s Context3=%s",
+           p->pDev3 ? "yes" : "no", p->pCtx3 ? "yes" : "no");
+
+    /* Wire DXGI runtime callbacks once the D3D11 device is up; this also
+     * records pfnPresentCb from the DXGI base callbacks. */
+    tritonInstallDXGIFuncs(p, pArgs);
+
+    /* Present-path locks; what each covers is documented on presentLock /
+     * kmCtxLock in triton.h.  Created only on the success path: a failed
+     * CreateDevice gets no matching DestroyDevice, so anything initialised
+     * before this point would never be deleted. */
+    InitializeCriticalSection(&p->presentLock);
+    InitializeCriticalSection(&p->kmCtxLock);
+    p->presentLockInit = TRUE;
+    p->Km.pLock = &p->kmCtxLock;
+
+    /* The kernel context must exist before the runtime's first
+     * dxgkrnl-side operation on it, and those are not all DDI-visible:
+     * ID3D11DeviceContext4::Signal / Wait on a monitored fence never reach
+     * the UMD (there are no fence DDIs), the runtime signals from GPU on
+     * the device's context itself -- and a headless device (no swapchain,
+     * no primary; the EOS overlay's in-game D3D11 device is one) fails
+     * that with E_INVALIDARG when the context is still missing.  Create
+     * it up front on the WDDM2 (virtual) path; the legacy path keeps its
+     * lazy creation on the first present. */
+    if (p->KTCallbacks.pfnCreateContextVirtualCb)
+        tritonPresentEnsureKernelContext(p);
+    return S_OK;
+}
+
+static SIZE_T APIENTRY tritonCalcPrivateDeviceSize(D3D10DDI_HADAPTER hAdapter,
+                                                   const D3D10DDIARG_CALCPRIVATEDEVICESIZE *pArgs)
+{
+    (void)hAdapter;
+    (void)pArgs;
+    return sizeof(TRITON_DEVICE);
+}
+
+static HRESULT APIENTRY tritonCloseAdapter(D3D10DDI_HADAPTER hAdapter)
+{
+    PTRITON_ADAPTER pAdapter = (PTRITON_ADAPTER)(hAdapter.pDrvPrivate);
+    TR_LOG("CloseAdapter");
+    if (pAdapter) {
+        if (pAdapter->pCapsCtx)
+            ID3D11DeviceContext_Release(pAdapter->pCapsCtx);
+        if (pAdapter->pCapsDev)
+            ID3D11Device_Release(pAdapter->pCapsDev);
+        if (pAdapter->pHostCaps11)
+            HeapFree(GetProcessHeap(), 0, pAdapter->pHostCaps11);
+        HeapFree(GetProcessHeap(), 0, pAdapter);
+    }
+    return S_OK;
+}
+
+/* Capability-driven DDI version ladder.  The ceiling depends on state
+ * only a kernel probe can see -- the KMD's WDDM mode and the host capset
+ * -- and GetSupportedVersions runs before any device (and therefore any
+ * transport) exists, so the probe is a latched one-shot D3DKMT query
+ * (tritonSharedBridgeAdapterProbe).
+ *
+ * WDDM2.x needs the KMD in WDDM2 (GpuMmu) mode: the runtime's device
+ * finalization enforces the depth-stencil-family MSAA consistency rule
+ * (satisfied via MULTISAMPLE_LOAD reporting, see tritonQuery.c) and
+ * queries GPU-VA caps that must match the KMD's GpuMmu configuration.
+ * The KMD reports WDDMv2.2 unconditionally, so the full 2.0-2.3 range
+ * is offered whenever the probe sees WDDM2 (dxgkrnl validates each tier's
+ * features -- offer/reclaim v2, sync tokens, shader-cache sessions --
+ * against the KMD's reported version, satisfied at 2.2).  The runtime
+ * picks the highest; NPT_DEBUG=wddm2_0_only clamps for triage.
+ *
+ * The 2.3 UMD DDI is deliberately offered ABOVE the KMD's 2.2.  It adds
+ * no device-funcs entry of its own -- the CREATEDEVICE union skips from
+ * pWDDM2_2DeviceFuncs to pWDDM2_6DeviceFuncs, so 2.3 reuses the 2.2
+ * struct -- but the runtime's per-format requirement tables
+ * (CD3D11FormatHelper::TypedUnorderedAccessViewSupport) only consult the
+ * driver's typed-UAV format bits at driverVersion >= 7, which is the 2.3
+ * DDI; at 2.2 and below BGRA8 typed UAV is table-blocked outright no
+ * matter what the format mask says.  The KMD side must NOT follow:
+ * registering 2.3 kernel-side routes every flip through the
+ * unimplemented MPO3 flip DDI and bugchecks 0xD1. */
+static UINT32 tritonSelectVersions(UINT64 *pVersions)
+{
+    struct triton_adapter_probe probe;
+    tritonSharedBridgeAdapterProbe(&probe);
+
+    UINT32 n = 0;
+    pVersions[n++] = D3D11_0_DDI_SUPPORTED;
+    pVersions[n++] = D3D11_1_DDI_SUPPORTED;
+    if (!probe.viogpu || probe.no_wddm2_ddi)
+        return n;
+    pVersions[n++] = D3DWDDM1_3_DDI_SUPPORTED;
+    if (probe.wddm2 && probe.host_ok) {
+        pVersions[n++] = D3DWDDM2_0_DDI_SUPPORTED;
+        if (!probe.wddm2_0_only) {
+            pVersions[n++] = D3DWDDM2_1_DDI_SUPPORTED;
+            pVersions[n++] = D3DWDDM2_2_DDI_SUPPORTED;
+            pVersions[n++] = D3DWDDM2_3_DDI_SUPPORTED;
+        }
+    }
+    return n;
+}
+
+static HRESULT APIENTRY tritonGetSupportedVersions(D3D10DDI_HADAPTER hAdapter,
+                                                   UINT32 *puEntries,
+                                                   UINT64 *pSupportedDDIInterfaceVersions)
+{
+    (void)hAdapter;
+    UINT64 versions[8];
+    const UINT32 kCount = tritonSelectVersions(versions);
+
+    if (!puEntries)
+        return E_INVALIDARG;
+
+    if (!pSupportedDDIInterfaceVersions) {
+        *puEntries = kCount;
+        return S_OK;
+    }
+
+    const UINT32 toCopy = (*puEntries < kCount) ? *puEntries : kCount;
+    for (UINT32 i = 0; i < toCopy; ++i)
+        pSupportedDDIInterfaceVersions[i] = versions[i];
+    *puEntries = toCopy;
+    TR_LOG("GetSupportedVersions: %u entries (ceiling 0x%08x)",
+           toCopy, (UINT32)(versions[kCount - 1] >> 32));
+    return S_OK;
+}
+
+/* ---------- adapter-scope host caps ---------- */
+
+static BOOL CALLBACK tritonHostCapsInit(PINIT_ONCE once, PVOID param, PVOID *ctx)
+{
+    (void)once; (void)ctx;
+    PTRITON_ADAPTER pAdapter = (PTRITON_ADAPTER)param;
+    struct triton_host_caps11 *s = (struct triton_host_caps11 *)HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*s));
+    if (!s)
+        return TRUE;
+    ID3D11Device *dev = NULL;
+    ID3D11DeviceContext *devCtx = NULL;
+    tritonHostCaps11Snapshot(s, &dev, &devCtx);
+    pAdapter->pCapsDev = dev;
+    pAdapter->pCapsCtx = devCtx;
+    pAdapter->CapsFeatureLevel = s->featureLevel;
+    pAdapter->pHostCaps11 = s;
+    return TRUE;
+}
+
+static const struct triton_host_caps11 *tritonHostCaps(PTRITON_ADAPTER pAdapter)
+{
+    static const struct triton_host_caps11 kNone;
+    if (!pAdapter)
+        return &kNone;
+    InitOnceExecuteOnce(&pAdapter->HostCapsOnce, tritonHostCapsInit,
+                        pAdapter, NULL);
+    return pAdapter->pHostCaps11 ? pAdapter->pHostCaps11 : &kNone;
+}
+
+#define HC11(bit) ((hc->have & TRITON_HC11_##bit) != 0)
+#define CAP11_HOST(name, lv, bit, hv) \
+    TRITON_CAP_HOST("d3d11", name, lv, HC11(bit), hv)
+#define CAP11_FIXED(name, lv, bit, hv, v, why) \
+    TRITON_CAP_FIXED("d3d11", name, lv, HC11(bit), hv, v, why)
+#define CAP11_TODO(name, lv, bit, hv, v, why) \
+    TRITON_CAP_TODO("d3d11", name, lv, HC11(bit), hv, v, why)
+
+static HRESULT APIENTRY tritonGetCaps(D3D10DDI_HADAPTER hAdapter,
+                                      const D3D10_2DDIARG_GETCAPS *pArgs)
+{
+    PTRITON_ADAPTER pAdapter = (PTRITON_ADAPTER)hAdapter.pDrvPrivate;
+    TR_LOG_HOT("GetCaps: Type=%d", pArgs->Type);
+    if (!pArgs->pData || !pArgs->DataSize) return S_OK;
+    ZeroMemory(pArgs->pData, pArgs->DataSize);
+
+    const struct triton_host_caps11 *hc = tritonHostCaps(pAdapter);
+
+    switch (pArgs->Type) {
+    case D3D11DDICAPS_THREADING: {
+        /* Not a reporting gap: without COMMANDLISTS the runtime emulates
+         * deferred contexts in software, but claiming FREETHREADED +
+         * COMMANDLISTS needs the UMD to be safe for concurrent creates
+         * and to implement driver command lists.  A claim without that is
+         * a data race, not a wrong pixel. */
+        D3D11DDI_THREADING_CAPS *pCaps = (D3D11DDI_THREADING_CAPS *)pArgs->pData;
+        UINT hostBits = 0;
+        if (hc->threading.DriverConcurrentCreates) hostBits |= D3D11DDICAPS_FREETHREADED;
+        if (hc->threading.DriverCommandLists) hostBits |= D3D11DDICAPS_COMMANDLISTS_BUILD_2;
+        CAP11_TODO("THREADING.Caps", pCaps->Caps, THREADING, hostBits, 0,
+                   "UMD thread-safety for concurrent creates + driver command lists");
+        break;
+    }
+    case D3D11DDICAPS_SHADER: {
+        /* The 0x10/0x20/0x40 bits are what back the runtime's OPTIONS2
+         * PSSpecifiedStencilRef / TypedUAVLoadAdditionalFormats / ROVs
+         * answers (OPTIONS2 at DDI level carries only the conservative-
+         * rasterization tier).  The typed-UAV-load claim is backed per
+         * format by UAV_READS in tritonTranslateFormatSupport -- keep the
+         * two in sync. */
+        D3D11DDI_SHADER_CAPS *pCaps = (D3D11DDI_SHADER_CAPS *)pArgs->pData;
+        BOOL b;
+#define SHADER_BIT(name, bit, hv, flag)                                       \
+        do {                                                                   \
+            b = FALSE;                                                         \
+            CAP11_HOST(name, b, bit, hv);                                      \
+            if (b) pCaps->Caps |= (flag);                                      \
+        } while (0)
+        SHADER_BIT("SHADER.Doubles", DOUBLES,
+                   hc->doubles.DoublePrecisionFloatShaderOps,
+                   D3D11DDICAPS_SHADER_DOUBLES);
+        SHADER_BIT("SHADER.ComputePlusRawAndStructuredBuffersInShader4x", D3D10X,
+                   hc->d3d10x.ComputeShaders_Plus_RawAndStructuredBuffers_Via_Shader_4_x,
+                   D3D11DDICAPS_SHADER_COMPUTE_PLUS_RAW_AND_STRUCTURED_BUFFERS_IN_SHADER_4_X);
+        SHADER_BIT("SHADER.SpecifiedStencilRef", OPTIONS2,
+                   hc->options2.PSSpecifiedStencilRefSupported,
+                   D3D11DDICAPS_SHADER_SPECIFIED_STENCIL_REF);
+        SHADER_BIT("SHADER.TypedUAVLoadAdditionalFormats", OPTIONS2,
+                   hc->options2.TypedUAVLoadAdditionalFormats,
+                   D3D11DDICAPS_SHADER_TYPED_UAV_LOAD_ADDITIONAL_FORMATS);
+        SHADER_BIT("SHADER.ROVs", OPTIONS2, hc->options2.ROVsSupported,
+                   D3D11DDICAPS_SHADER_ROVS);
+#undef SHADER_BIT
+        break;
+    }
+    case D3D11_1DDICAPS_D3D11_OPTIONS: {
+        D3D11_1DDI_D3D11_OPTIONS_DATA *pCaps = (D3D11_1DDI_D3D11_OPTIONS_DATA *)pArgs->pData;
+        /* Required for the 11.1 pipeline level; the host backs it. */
+        CAP11_HOST("D3D11_OPTIONS.OutputMergerLogicOp", pCaps->OutputMergerLogicOp,
+                   OPTIONS, hc->options.OutputMergerLogicOp);
+        CAP11_FIXED("D3D11_OPTIONS.AssignDebugBinarySupport",
+                    pCaps->AssignDebugBinarySupport, OPTIONS, 0, FALSE,
+                    "no debug-binary DDI");
+        break;
+    }
+    case D3D11_1DDICAPS_ARCHITECTURE_INFO: {
+        /* DDI struct (d3d10umddi.h), not the layout-identical KMD
+         * D3DDDICAPS_ARCHITECTURE_INFO.
+         *
+         * Deliberately FALSE even when the host is tile-based (the capset
+         * carries TRITON_HOSTCAP_TBDR for DXMT): reporting TRUE switches
+         * D2D, DWM and XAML onto tile-deferred rendering strategies this
+         * stack does not execute correctly end to end, which costs text
+         * labels and title bars in Explorer and the Start menu.  The
+         * ledger keeps the host-truth record; revisit once those paths
+         * are validated. */
+        D3D11_1DDI_ARCHITECTURE_INFO_DATA *pCaps =
+            (D3D11_1DDI_ARCHITECTURE_INFO_DATA *)pArgs->pData;
+        struct triton_adapter_probe probe;
+        tritonSharedBridgeAdapterProbe(&probe);
+        const BOOL hostTbdr = (probe.caps_flags & TRITON_HOSTCAP_TBDR) ||
+                              (HC11(ARCH) && hc->arch.TileBasedDeferredRenderer);
+        TRITON_CAP_TODO("d3d11", "ARCHITECTURE_INFO.TileBasedDeferredRenderer",
+                        pCaps->TileBasedDeferredRenderer, TRUE, hostTbdr, FALSE,
+                        "validate tile-deferred D2D/DWM/XAML paths before reporting TRUE");
+        break;
+    }
+    case D3D11_1DDICAPS_SHADER_MIN_PRECISION_SUPPORT: {
+        /* DDI struct (d3d10umddi.h), not the KMD
+         * D3DDDICAPS_SHADER_MIN_PRECISION_SUPPORT -- same 8 bytes but
+         * different fields.  Both host backends report 16-bit minimum
+         * precision for every stage (half is ~2x on Apple GPUs); without
+         * this the runtime promotes min16float to fp32 before the DXBC
+         * ever reaches the host.  The DDI and API flag encodings agree
+         * (10_BIT = 1, 16_BIT = 2). */
+        D3D11_DDI_SHADER_MIN_PRECISION_SUPPORT_DATA *pCaps =
+            (D3D11_DDI_SHADER_MIN_PRECISION_SUPPORT_DATA *)pArgs->pData;
+        CAP11_HOST("SHADER_MIN_PRECISION.PixelShader", pCaps->PixelShaderMinPrecision,
+                   MINPREC, hc->minPrec.PixelShaderMinPrecision);
+        CAP11_HOST("SHADER_MIN_PRECISION.AllOtherStages", pCaps->AllOtherStagesMinPrecision,
+                   MINPREC, hc->minPrec.AllOtherShaderStagesMinPrecision);
+        break;
+    }
+    case D3D11DDICAPS_3DPIPELINESUPPORT: {
+        D3D11DDI_3DPIPELINESUPPORT_CAPS *pCaps = (D3D11DDI_3DPIPELINESUPPORT_CAPS *)pArgs->pData;
+        /* D3D feature levels are strict supersets: an 11.0-capable device
+         * must also report 10.1/10.0. Advertising 11.x alone is an invalid
+         * mask and the runtime rejects the adapter (falling back to WARP).
+         * The range runs from 10.0 to the level the host device came up
+         * at, capped at 11.1: the 12_x pipeline levels are D3D12's. */
+        UINT hostFL = (UINT)hc->featureLevel;
+        UINT top = 0;
+        TRITON_CAP_HOST("d3d11", "3DPIPELINESUPPORT.HighestFeatureLevel", top,
+                        hc->probed,
+                        hostFL > (UINT)D3D_FEATURE_LEVEL_11_1 ? (UINT)D3D_FEATURE_LEVEL_11_1 : hostFL);
+        pCaps->Caps = D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_0);
+        if (top >= (UINT)D3D_FEATURE_LEVEL_10_1)
+            pCaps->Caps |= D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_10_1);
+        if (top >= (UINT)D3D_FEATURE_LEVEL_11_0)
+            pCaps->Caps |= D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11DDI_3DPIPELINELEVEL_11_0);
+        if (top >= (UINT)D3D_FEATURE_LEVEL_11_1)
+            pCaps->Caps |= D3D11DDI_ENCODE_3DPIPELINESUPPORT_CAP(D3D11_1DDI_3DPIPELINELEVEL_11_1);
+        break;
+    }
+    case D3DWDDM1_3DDICAPS_D3D11_OPTIONS1: {
+        /* Tiled resources need the WDDM 1.3 tile-mapping DDI entry
+         * points, which are stubs; the flags stay clear
+         * whatever the host's tier.  The field is a cumulative
+         * D3DWDDM1_3DDI_TILED_RESOURCES_SUPPORT_FLAG bitmask (tier N =
+         * (1 << N) - 1), not the API's ordinal tier, so the host tier
+         * is encoded as flags before it enters the ledger. */
+        D3DWDDM1_3DDI_D3D11_OPTIONS_DATA1 *pCaps =
+            (D3DWDDM1_3DDI_D3D11_OPTIONS_DATA1 *)pArgs->pData;
+        CAP11_TODO("D3D11_OPTIONS1.TiledResourcesSupportFlags",
+                   pCaps->TiledResourcesSupportFlags, OPTIONS2,
+                   (1u << hc->options2.TiledResourcesTier) - 1, 0,
+                   "tiled resources not wired (MISC_TILED/TILE_POOL dropped at create, tile DDIs stubbed)");
+        break;
+    }
+    case D3DWDDM2_0DDICAPS_D3D11_OPTIONS2: {
+        /* Only the conservative-rasterization tier lives at DDI level;
+         * the rest of the API OPTIONS2 struct is SHADER caps + runtime. */
+        D3DWDDM2_0DDI_D3D11_OPTIONS2_DATA *pCaps =
+            (D3DWDDM2_0DDI_D3D11_OPTIONS2_DATA *)pArgs->pData;
+        CAP11_HOST("D3D11_OPTIONS2.ConservativeRasterizationTier",
+                   pCaps->ConservativeRasterizationTier, OPTIONS2,
+                   hc->options2.ConservativeRasterizationTier);
+        break;
+    }
+    case D3DWDDM2_0DDICAPS_MEMORY_ARCHITECTURE: {
+        /* Virtual GPU over host system memory: UMA on every host.  D3D11
+         * maps a DEFAULT texture through the guest's map ring
+         * (MapOnDefaultTextures, npt_d3d11_texture_is_mappable), never
+         * through a host texture's own CPU address, so unlike D3D12 the
+         * answer does not depend on the host taking ROW_MAJOR textures.
+         * Not CacheCoherent -- the KMD's GpuMmu is bookkeeping-only and
+         * blob CPU access rides the KMD-owned BAR mapping, so no coherency
+         * contract with GPU caches can be promised. */
+        D3DWDDM2_0DDI_MEMORY_ARCHITECTURE_CAPS *pCaps =
+            (D3DWDDM2_0DDI_MEMORY_ARCHITECTURE_CAPS *)pArgs->pData;
+        CAP11_FIXED("MEMORY_ARCHITECTURE.UMA", pCaps->UMA, OPTIONS2,
+                    hc->options2.UnifiedMemoryArchitecture, TRUE,
+                    "KMD segment model: guest blobs live in host system memory");
+        CAP11_FIXED("MEMORY_ARCHITECTURE.CacheCoherent", pCaps->CacheCoherent,
+                    OPTIONS2, 0, FALSE,
+                    "BAR-mapped blob access has no GPU cache coherency contract");
+        break;
+    }
+    case D3DWDDM2_0DDICAPS_GPUVA_CAPS: {
+        /* Must match the KMD's DXGK_GPUMMUCAPS.VirtualAddressBitCount (48)
+         * and the D3D12 UMD's MaxGPUVirtualAddressBitsPerResource; zero
+         * fails device create at the WDDM2.x interface. */
+        D3DWDDM2_0DDI_GPUVA_CAPS_DATA *pCaps =
+            (D3DWDDM2_0DDI_GPUVA_CAPS_DATA *)pArgs->pData;
+        CAP11_FIXED("GPUVA.MaxGPUVirtualAddressBitsPerResource",
+                    pCaps->MaxGPUVirtualAddressBitsPerResource, GPUVA,
+                    hc->gpuva.MaxGPUVirtualAddressBitsPerResource, 48,
+                    "KMD GpuMmu VA width; host VAs are not guest VAs");
+        break;
+    }
+    case D3DWDDM2_0DDICAPS_D3D11_OPTIONS3: {
+        /* Shader-side: the host routes SV_ViewportArrayIndex /
+         * SV_RenderTargetArrayIndex written by any pre-rasterizer stage. */
+        D3DWDDM2_0DDI_D3D11_OPTIONS3_DATA *pCaps =
+            (D3DWDDM2_0DDI_D3D11_OPTIONS3_DATA *)pArgs->pData;
+        CAP11_HOST("D3D11_OPTIONS3.VPAndRTArrayIndexFromAnyShaderFeedingRasterizer",
+                   pCaps->VPAndRTArrayIndexFromAnyShaderFeedingRasterizer,
+                   OPTIONS3, hc->options3.VPAndRTArrayIndexFromAnyShaderFeedingRasterizer);
+        break;
+    }
+    case D3DWDDM2_2DDICAPS_SHADERCACHE: {
+        /* Queried by the runtime once the 2.2 DDI is advertised; the case
+         * must exist (an unhandled type at a new tier is the historical
+         * 0x887a0020 failure shape).  RequestRuntimeShaderCache stays
+         * FALSE: shader compilation happens host-side and both backends
+         * keep their own caches, so a runtime-managed cache of UMD blobs
+         * would cache nothing real.  The session entrypoints in the 2.2
+         * device funcs are callable-safe stubs regardless. */
+        D3DWDDM2_2DDICAPS_SHADERCACHE_DATA *pCaps =
+            (D3DWDDM2_2DDICAPS_SHADERCACHE_DATA *)pArgs->pData;
+        CAP11_FIXED("SHADERCACHE.RequestRuntimeShaderCache",
+                    pCaps->RequestRuntimeShaderCache, SHADERCACHE,
+                    hc->shaderCache.SupportFlags, FALSE,
+                    "shaders compile host-side; a runtime cache of UMD blobs caches nothing");
+        break;
+    }
+    default:
+        /* Unhandled cap types keep the zero-filled pData set above, i.e.
+         * "feature off": D3DWDDM1_3DDICAPS_MARKER (137) and the
+         * D3DWDDM2_xDDICAPS_TEXTURE_LAYOUT / _SWIZZLE_PATTERN family
+         * (row-major only). */
+        break;
+    }
+    return S_OK;
+}
+
+#undef HC11
+#undef CAP11_HOST
+#undef CAP11_FIXED
+#undef CAP11_TODO
+
+/* ---------- OpenAdapter10_2 ---------- */
+
+HRESULT APIENTRY OpenAdapter10_2(D3D10DDIARG_OPENADAPTER *pOpenData)
+{
+    TR_LOG("OpenAdapter10_2: Interface=0x%08x Version=0x%08x",
+           pOpenData->Interface, pOpenData->Version);
+
+    PTRITON_ADAPTER pAdapter = (PTRITON_ADAPTER)(
+        HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(TRITON_ADAPTER)));
+    if (!pAdapter) return E_OUTOFMEMORY;
+
+    pAdapter->hRTAdapter  = pOpenData->hRTAdapter;
+
+    pOpenData->hAdapter.pDrvPrivate = pAdapter;
+
+    D3D10_2DDI_ADAPTERFUNCS *p = pOpenData->pAdapterFuncs_2;
+    p->pfnCalcPrivateDeviceSize  = tritonCalcPrivateDeviceSize;
+    p->pfnCreateDevice           = tritonCreateDevice;
+    p->pfnCloseAdapter           = tritonCloseAdapter;
+    p->pfnGetSupportedVersions   = tritonGetSupportedVersions;
+    p->pfnGetCaps                = tritonGetCaps;
+    return S_OK;
+}
+
+#pragma GCC diagnostic pop

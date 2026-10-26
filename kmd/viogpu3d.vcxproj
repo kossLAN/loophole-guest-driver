@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{B806D782-DAF3-42C8-9E55-62077D13D6FC}</ProjectGuid>
+    <TemplateGuid>{E8938A1F-DD6F-435F-9067-9502172282FD}</TemplateGuid>
+    <RootNamespace>viogpu3d</RootNamespace>
+    <ProjectName>viogpu3d</ProjectName>
+    <MinimumVisualStudioVersion>17.0</MinimumVisualStudioVersion>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+    <DriverTargetPlatform>Universal</DriverTargetPlatform>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <SpectreMitigation>false</SpectreMitigation>
+    <ALLOW_DATE_TIME>1</ALLOW_DATE_TIME>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup>
+    <LoopholeVersion Condition="'$(LoopholeVersion)'==''">1.0.0.0</LoopholeVersion>
+    <LoopholeTestSign Condition="'$(LoopholeTestSign)'==''">true</LoopholeTestSign>
+    <OutDir>$(MSBuildThisFileDirectory)..\out\kmd\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildThisFileDirectory)..\build\kmd\$(Configuration)\</IntDir>
+    <TargetName>viogpu3d</TargetName>
+    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+    <!-- installer\package.proj stamps, catalogs and signs the whole package, user-mode files included. -->
+    <SignMode>Off</SignMode>
+    <EnableInf2cat>false</EnableInf2cat>
+    <ApiValidator_Enable>false</ApiValidator_Enable>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>..\abi;VirtIO;VirtIO\windows;viogpu\common;viogpu\viogpu3d;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>VIOGPU_3D=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <!-- The driver predates the /permissive- that C++20, viogpu_allocation.cpp's standard, turns on
+           (string literals as PCHAR, among others). -->
+      <ConformanceMode>false</ConformanceMode>
+      <AdditionalOptions>/permissive %(AdditionalOptions)</AdditionalOptions>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <!-- trace.h always defines DBG and logs through DbgPrint or COM1, never WPP. -->
+      <WppEnabled>false</WppEnabled>
+      <RuntimeTypeInfo>false</RuntimeTypeInfo>
+      <ExceptionHandling>false</ExceptionHandling>
+    </ClCompile>
+    <ClCompile Condition="'$(Configuration)'=='Debug'">
+      <PreprocessorDefinitions>COM_DEBUG=1;DBG_VERBOSE=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>$(KernelBufferOverflowLib);$(DDK_LIB_PATH)ntoskrnl.lib;$(DDK_LIB_PATH)hal.lib;$(DDK_LIB_PATH)wmilib.lib;$(DDK_LIB_PATH)displib.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="VirtIO\VirtIOPCICommon.c" />
+    <ClCompile Include="VirtIO\VirtIOPCILegacy.c" />
+    <ClCompile Include="VirtIO\VirtIOPCIModern.c" />
+    <ClCompile Include="VirtIO\VirtIORing-Packed.c" />
+    <ClCompile Include="VirtIO\VirtIORing.c" />
+    <ClCompile Include="viogpu\common\baseobj.cpp" />
+    <ClCompile Include="viogpu\common\bitops.cpp" />
+    <ClCompile Include="viogpu\common\edid.cpp" />
+    <ClCompile Include="viogpu\common\viogpu_idr.cpp" />
+    <ClCompile Include="viogpu\common\viogpu_pci.cpp" />
+    <ClCompile Include="viogpu\common\viogpu_pnp_fixup.cpp" />
+    <ClCompile Include="viogpu\common\viogpu_queue.cpp" />
+    <ClCompile Include="viogpu\viogpu3d\driver.cpp" />
+    <ClCompile Include="viogpu\viogpu3d\viogpu_adapter.cpp" />
+    <!-- Only this file builds as C++20, as upstream has it. From C++17 on, deleting the adapter,
+         which holds a cache-aligned lookaside list, takes an aligned operator delete that the
+         kernel has no runtime for. -->
+    <ClCompile Include="viogpu\viogpu3d\viogpu_allocation.cpp">
+      <LanguageStandard>stdcpp20</LanguageStandard>
+    </ClCompile>
+    <ClCompile Include="viogpu\viogpu3d\viogpu_command.cpp" />
+    <ClCompile Include="viogpu\viogpu3d\viogpu_device.cpp" />
+    <ClCompile Include="viogpu\viogpu3d\viogpu_ringfence.cpp" />
+    <ClCompile Include="viogpu\viogpu3d\viogpu_vidpn.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..\abi\viogpum.h" />
+    <ClInclude Include="VirtIO\kdebugprint.h" />
+    <ClInclude Include="VirtIO\osdep.h" />
+    <ClInclude Include="VirtIO\VirtIO.h" />
+    <ClInclude Include="VirtIO\virtio_pci.h" />
+    <ClInclude Include="VirtIO\virtio_pci_common.h" />
+    <ClInclude Include="VirtIO\virtio_ring.h" />
+    <ClInclude Include="VirtIO\linux\types.h" />
+    <ClInclude Include="VirtIO\linux\virtio_config.h" />
+    <ClInclude Include="VirtIO\linux\virtio_types.h" />
+    <ClInclude Include="VirtIO\windows\virtio_ring_allocation.h" />
+    <ClInclude Include="viogpu\common\baseobj.h" />
+    <ClInclude Include="viogpu\common\bitops.h" />
+    <ClInclude Include="viogpu\common\edid.h" />
+    <ClInclude Include="viogpu\common\handle.h" />
+    <ClInclude Include="viogpu\common\helper.h" />
+    <ClInclude Include="viogpu\common\linked_list.h" />
+    <ClInclude Include="viogpu\common\venus_hw.h" />
+    <ClInclude Include="viogpu\common\viogpu.h" />
+    <ClInclude Include="viogpu\common\viogpu_idr.h" />
+    <ClInclude Include="viogpu\common\viogpu_pci.h" />
+    <ClInclude Include="viogpu\common\viogpu_pnp_fixup.h" />
+    <ClInclude Include="viogpu\common\viogpu_queue.h" />
+    <ClInclude Include="viogpu\common\virgl_hw.h" />
+    <ClInclude Include="viogpu\viogpudo\viogpudo.h" />
+    <ClInclude Include="viogpu\viogpu3d\driver.h" />
+    <ClInclude Include="viogpu\viogpu3d\trace.h" />
+    <ClInclude Include="viogpu\viogpu3d\viogpu_adapter.h" />
+    <ClInclude Include="viogpu\viogpu3d\viogpu_allocation.h" />
+    <ClInclude Include="viogpu\viogpu3d\viogpu_command.h" />
+    <ClInclude Include="viogpu\viogpu3d\viogpu_device.h" />
+    <ClInclude Include="viogpu\viogpu3d\viogpu_ringfence.h" />
+    <ClInclude Include="viogpu\viogpu3d\viogpu_vidpn.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="viogpu\viogpu3d\viogpu3d.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="viogpu3d.inf" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="LoopholeVersionHeader" BeforeTargets="ResourceCompile">
+    <MakeDir Directories="$(IntDir)" />
+    <WriteLinesToFile File="$(IntDir)loophole_version.h" Overwrite="true" WriteOnlyWhenDifferent="true"
+                      Lines="#define LOOPHOLE_VERSION $(LoopholeVersion.Replace('.', ','));#define LOOPHOLE_VERSION_STR &quot;$(LoopholeVersion)&quot;" />
+  </Target>
+  <Target Name="LoopholeTestSign" AfterTargets="Link" Condition="'$(LoopholeTestSign)'=='true'">
+    <Exec Command="&quot;$(WindowsSdkDir)bin\$(TargetPlatformVersion)\x64\signtool.exe&quot; sign /q /fd SHA256 /f &quot;$(MSBuildThisFileDirectory)cert\loophole-test.pfx&quot; /p loophole &quot;$(TargetPath)&quot;" />
+  </Target>
+</Project>

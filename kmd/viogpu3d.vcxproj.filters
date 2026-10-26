@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="abi">
+      <UniqueIdentifier>{3a399798-5fd1-41e4-829e-f0656a2dca1e}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="VirtIO">
+      <UniqueIdentifier>{42013b9e-a6ff-4d44-aed7-914f6f929374}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="common">
+      <UniqueIdentifier>{55a9c8b4-04b9-4555-b295-34aac3211142}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="viogpu3d">
+      <UniqueIdentifier>{02cfc489-357e-49f4-8838-41978570e671}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="VirtIOVirtIOPCICommon.c">
+      <Filter>VirtIO</Filter>
+    </ClCompile>
+    <ClCompile Include="VirtIOVirtIOPCILegacy.c">
+      <Filter>VirtIO</Filter>
+    </ClCompile>
+    <ClCompile Include="VirtIOVirtIOPCIModern.c">
+      <Filter>VirtIO</Filter>
+    </ClCompile>
+    <ClCompile Include="VirtIOVirtIORing-Packed.c">
+      <Filter>VirtIO</Filter>
+    </ClCompile>
+    <ClCompile Include="VirtIOVirtIORing.c">
+      <Filter>VirtIO</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpucommonbaseobj.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpucommonbitops.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpucommonedid.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpucommonviogpu_idr.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpucommonviogpu_pci.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpucommonviogpu_pnp_fixup.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpucommonviogpu_queue.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpuviogpu3ddriver.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpuviogpu3dviogpu_adapter.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpuviogpu3dviogpu_allocation.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpuviogpu3dviogpu_command.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpuviogpu3dviogpu_device.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpuviogpu3dviogpu_ringfence.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+    <ClCompile Include="viogpuviogpu3dviogpu_vidpn.cpp">
+      <Filter>viogpu3d</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="..abiviogpum.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtIOkdebugprint.h">
+      <Filter>VirtIO</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtIOosdep.h">
+      <Filter>VirtIO</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtIOVirtIO.h">
+      <Filter>VirtIO</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtIOvirtio_pci.h">
+      <Filter>VirtIO</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtIOvirtio_pci_common.h">
+      <Filter>VirtIO</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtIOvirtio_ring.h">
+      <Filter>VirtIO</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtIOlinuxtypes.h">
+      <Filter>VirtIO</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtIOlinuxvirtio_config.h">
+      <Filter>VirtIO</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtIOlinuxvirtio_types.h">
+      <Filter>VirtIO</Filter>
+    </ClInclude>
+    <ClInclude Include="VirtIOwindowsvirtio_ring_allocation.h">
+      <Filter>VirtIO</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonbaseobj.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonbitops.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonedid.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonhandle.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonhelper.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonlinked_list.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonvenus_hw.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonviogpu.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonviogpu_idr.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonviogpu_pci.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonviogpu_pnp_fixup.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonviogpu_queue.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpucommonvirgl_hw.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpuviogpudoviogpudo.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpuviogpu3ddriver.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpuviogpu3dtrace.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpuviogpu3dviogpu_adapter.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpuviogpu3dviogpu_allocation.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpuviogpu3dviogpu_command.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpuviogpu3dviogpu_device.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpuviogpu3dviogpu_ringfence.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+    <ClInclude Include="viogpuviogpu3dviogpu_vidpn.h">
+      <Filter>viogpu3d</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="viogpu\viogpu3d\viogpu3d.rc">
+      <Filter>viogpu3d</Filter>
+    </ResourceCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="viogpu3d.inf" />
+  </ItemGroup>
+</Project>

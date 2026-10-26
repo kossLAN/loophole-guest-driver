@@ -1,0 +1,2322 @@
+/*
+ * Copyright (C) 2019-2020 Red Hat, Inc.
+ *
+ * Written By: Vadim Rozenfeld <vrozenfe@redhat.com>
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met :
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and / or other materials provided with the distribution.
+ * 3. Neither the names of the copyright holders nor the names of their contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.IN NO EVENT SHALL THE COPYRIGHT HOLDERS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+#include "viogpu_queue.h"
+#include "baseobj.h"
+#if !DBG
+#include "viogpu_queue.tmh"
+#endif
+
+static BOOLEAN BuildSGElement(VirtIOBufferDescriptor *sg, PVOID buf, ULONG size)
+{
+    if (size != 0 && MmIsAddressValid(buf))
+    {
+        sg->length = min(size, PAGE_SIZE);
+        sg->physAddr = MmGetPhysicalAddress(buf);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+//
+// Heap-allocated wait context used by synchronous Ask* helpers. A stack
+// KEVENT lets the DPC dereference a returned-stack address after the
+// caller times out; reference-count the wait context instead so the
+// caller and queue each hold a ref. The callback that fires from the
+// response DPC signals the event and drops the queue's ref; if the
+// caller has already released (timeout path), the same callback flips
+// auto_release on the vbuf so the DPC frees it on the way out.
+//
+PVIOGPU_WAIT_CTX VioGpuAllocWaitCtx()
+{
+    PVIOGPU_WAIT_CTX ctx = new (NonPagedPoolNx) VIOGPU_WAIT_CTX();
+    if (!ctx)
+    {
+        return NULL;
+    }
+    KeInitializeEvent(&ctx->event, NotificationEvent, FALSE);
+    ctx->refCount = 1;
+    ctx->vbuf = NULL;
+    ctx->abandoned = 0;
+    return ctx;
+}
+
+void VioGpuWaitCtxCompleteCB(void *p, void *, void *)
+{
+    PVIOGPU_WAIT_CTX ctx = (PVIOGPU_WAIT_CTX)p;
+    KeSetEvent(&ctx->event, IO_NO_INCREMENT, FALSE);
+    LONG remaining = InterlockedDecrement(&ctx->refCount);
+    ASSERT(remaining >= 0);
+    if (remaining == 0)
+    {
+        // Reaching zero here happens two ways, and they need opposite
+        // vbuf treatment.  TIMEOUT: the caller abandoned the wait (it
+        // set ctx->abandoned before dropping its ref), nobody will
+        // release the vbuf -- flip auto_release so the DPC frees it on
+        // the way out.  SUCCESS: the caller woke on the KeSetEvent
+        // above and decremented before we did; it still OWNS the vbuf,
+        // is reading the response, and will ReleaseBuffer it itself.
+        // Flipping auto_release then made the DPC free/recycle the vbuf
+        // under the caller, and the caller's own later ReleaseBuffer
+        // released a vbuf that meanwhile belonged to a DIFFERENT
+        // in-flight command -- eating that command's completion (the
+        // commander wedges on its running slot and dxgkrnl TDRs).
+        if (ctx->abandoned && ctx->vbuf)
+        {
+            ctx->vbuf->auto_release = true;
+        }
+        delete ctx;
+    }
+}
+
+BOOLEAN VioGpuWaitCtxFinish(PVIOGPU_WAIT_CTX ctx,
+                            PGPU_VBUFFER vbuf,
+                            VioGpuQueue *queue,
+                            NTSTATUS waitStatus)
+{
+    if (waitStatus != STATUS_TIMEOUT)
+    {
+        // Success path: queue already decremented in the callback.
+        LONG remaining = InterlockedDecrement(&ctx->refCount);
+        ASSERT(remaining >= 0);
+        if (remaining == 0)
+        {
+            delete ctx;
+        }
+        return TRUE;
+    }
+
+    // Publish the abandonment BEFORE dropping the ref: the callback
+    // observing refCount 0 must be able to trust the flag.
+    InterlockedExchange(&ctx->abandoned, 1);
+    LONG remaining = InterlockedDecrement(&ctx->refCount);
+    ASSERT(remaining >= 0);
+    if (remaining == 0)
+    {
+        // Race: queue side completed after KeWait returned TIMEOUT but
+        // before we got here. The DPC has already processed the vbuf
+        // with auto_release == false, so free it ourselves.
+        if (queue && vbuf)
+        {
+            queue->ReleaseBuffer(vbuf);
+        }
+        delete ctx;
+    }
+    return FALSE;
+}
+
+VioGpuQueue::VioGpuQueue()
+{
+    m_pBuf = NULL;
+    m_Index = (UINT)-1;
+    m_pVIODevice = NULL;
+    m_pVirtQueue = NULL;
+    KeInitializeSpinLock(&m_SpinLock);
+}
+
+VioGpuQueue::~VioGpuQueue()
+{
+    Close();
+}
+
+void VioGpuQueue::Close(void)
+{
+    KIRQL SavedIrql;
+    Lock(&SavedIrql);
+    m_pVirtQueue = NULL;
+    Unlock(SavedIrql);
+}
+
+BOOLEAN VioGpuQueue::Init(_In_ VirtIODevice *pVIODevice, _In_ struct virtqueue *pVirtQueue, _In_ UINT index)
+{
+    if ((pVIODevice == NULL) || (pVirtQueue == NULL))
+    {
+        return FALSE;
+    }
+    m_pVIODevice = pVIODevice;
+    m_pVirtQueue = pVirtQueue;
+    m_Index = index;
+    EnableInterrupt();
+    return TRUE;
+}
+
+_IRQL_requires_max_(DISPATCH_LEVEL) _IRQL_saves_global_(OldIrql, Irql) _IRQL_raises_(DISPATCH_LEVEL) void VioGpuQueue::
+                                                                                                    Lock(KIRQL *Irql)
+{
+    KIRQL SavedIrql = KeGetCurrentIrql();
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s at IRQL %d\n", __FUNCTION__, SavedIrql));
+
+    if (SavedIrql < DISPATCH_LEVEL)
+    {
+        KeAcquireSpinLock(&m_SpinLock, &SavedIrql);
+    }
+    else if (SavedIrql == DISPATCH_LEVEL)
+    {
+        KeAcquireSpinLockAtDpcLevel(&m_SpinLock);
+    }
+    else
+    {
+        VioGpuDbgBreak();
+    }
+    *Irql = SavedIrql;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+_IRQL_requires_(DISPATCH_LEVEL) _IRQL_restores_global_(OldIrql, Irql) void VioGpuQueue::Unlock(KIRQL Irql)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s at IRQL %d\n", __FUNCTION__, Irql));
+
+    if (Irql < DISPATCH_LEVEL)
+    {
+        KeReleaseSpinLock(&m_SpinLock, Irql);
+    }
+    else
+    {
+        KeReleaseSpinLockFromDpcLevel(&m_SpinLock);
+    }
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+PAGED_CODE_SEG_BEGIN
+
+UINT VioGpuQueue::QueryAllocation()
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    USHORT NumEntries;
+    ULONG RingSize, HeapSize;
+
+    NTSTATUS status = virtio_query_queue_allocation(m_pVIODevice, m_Index, &NumEntries, &RingSize, &HeapSize);
+    if (!NT_SUCCESS(status))
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("[%s] virtio_query_queue_allocation(%d) failed with error %x\n", __FUNCTION__, m_Index, status));
+        return 0;
+    }
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return NumEntries;
+}
+PAGED_CODE_SEG_END
+
+PAGED_CODE_SEG_BEGIN
+
+BOOLEAN CtrlQueue::GetDisplayInfo(PGPU_VBUFFER buf, UINT id, PULONG xres, PULONG yres)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RESP_DISP_INFO resp = (PGPU_RESP_DISP_INFO)buf->resp_buf;
+    if (resp->hdr.type != VIRTIO_GPU_RESP_OK_DISPLAY_INFO)
+    {
+        DbgPrint(TRACE_LEVEL_VERBOSE, (" %s type = %x: disabled\n", __FUNCTION__, resp->hdr.type));
+        return FALSE;
+    }
+    if (resp->pmodes[id].enabled)
+    {
+        DbgPrint(TRACE_LEVEL_VERBOSE,
+                 ("output %d: %dx%d+%d+%d\n",
+                  id,
+                  resp->pmodes[id].r.width,
+                  resp->pmodes[id].r.height,
+                  resp->pmodes[id].r.x,
+                  resp->pmodes[id].r.y));
+        *xres = resp->pmodes[id].r.width;
+        *yres = resp->pmodes[id].r.height;
+    }
+    else
+    {
+        DbgPrint(TRACE_LEVEL_VERBOSE, ("output %d: disabled\n", id));
+        return FALSE;
+    }
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return TRUE;
+}
+
+BOOLEAN CtrlQueue::AskDisplayInfo(PGPU_VBUFFER *buf)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_CTRL_HDR cmd;
+    PGPU_VBUFFER vbuf;
+    PGPU_RESP_DISP_INFO resp_buf;
+    NTSTATUS status;
+
+    if (buf)
+    {
+        *buf = NULL;
+    }
+
+    resp_buf = reinterpret_cast<PGPU_RESP_DISP_INFO>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_DISP_INFO)]);
+
+    if (!resp_buf)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s Failed allocate %d bytes\n", __FUNCTION__, sizeof(GPU_RESP_DISP_INFO)));
+        return FALSE;
+    }
+
+    cmd = (PGPU_CTRL_HDR)AllocCmdResp(&vbuf, sizeof(GPU_CTRL_HDR), resp_buf, sizeof(GPU_RESP_DISP_INFO));
+    if (!cmd)
+    {
+        delete[] reinterpret_cast<PBYTE>(resp_buf);
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(GPU_CTRL_HDR));
+
+    cmd->type = VIRTIO_GPU_CMD_GET_DISPLAY_INFO;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(10000, -10000);
+
+    QueueBuffer(vbuf);
+    status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out\n", __FUNCTION__));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        return FALSE;
+    }
+
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+    *buf = vbuf;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return TRUE;
+}
+
+BOOLEAN CtrlQueue::AskEdidInfo(PGPU_VBUFFER *buf, UINT id)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_CMD_GET_EDID cmd;
+    PGPU_VBUFFER vbuf;
+    PGPU_RESP_EDID resp_buf;
+    NTSTATUS status;
+
+    if (buf)
+    {
+        *buf = NULL;
+    }
+
+    resp_buf = reinterpret_cast<PGPU_RESP_EDID>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_EDID)]);
+
+    if (!resp_buf)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s Failed allocate %d bytes\n", __FUNCTION__, sizeof(GPU_RESP_EDID)));
+        return FALSE;
+    }
+    cmd = (PGPU_CMD_GET_EDID)AllocCmdResp(&vbuf, sizeof(GPU_CMD_GET_EDID), resp_buf, sizeof(GPU_RESP_EDID));
+    if (!cmd)
+    {
+        delete[] reinterpret_cast<PBYTE>(resp_buf);
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(GPU_CMD_GET_EDID));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_GET_EDID;
+    cmd->scanout = id;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(10000, -10000);
+
+    QueueBuffer(vbuf);
+
+    status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out scanout=%u\n", __FUNCTION__, id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        return FALSE;
+    }
+
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+    *buf = vbuf;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return TRUE;
+}
+
+BOOLEAN CtrlQueue::GetEdidInfo(PGPU_VBUFFER buf, UINT id, PBYTE edid, PULONG size)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+    PGPU_CMD_GET_EDID cmd = (PGPU_CMD_GET_EDID)buf->buf;
+    PGPU_RESP_EDID resp = (PGPU_RESP_EDID)buf->resp_buf;
+    if (resp->hdr.type != VIRTIO_GPU_RESP_OK_EDID)
+    {
+        DbgPrint(TRACE_LEVEL_VERBOSE, (" %s type = %x: disabled\n", __FUNCTION__, resp->hdr.type));
+        return FALSE;
+    }
+    if (cmd->scanout != id)
+    {
+        DbgPrint(TRACE_LEVEL_VERBOSE, (" %s invalid scaout = %x\n", __FUNCTION__, cmd->scanout));
+        return FALSE;
+    }
+
+    // Each GET_EDID response carries the EDID of the requested scanout
+    // starting at resp->edid[0]. Trust resp->size as the bound: the host
+    // advertised how many bytes it actually filled. Clamp to the response
+    // buffer and to EDID_RAW_BLOCK_SIZE, and zero-fill the rest so callers
+    // never parse uninitialized tail bytes shaped by a malicious host.
+    ULONG host_size = resp->size;
+    if (host_size > sizeof(resp->edid))
+    {
+        host_size = sizeof(resp->edid);
+    }
+    ULONG to_copy = min(host_size, (ULONG)EDID_RAW_BLOCK_SIZE);
+    if (to_copy < EDID_V1_BLOCK_SIZE)
+    {
+        DbgPrint(TRACE_LEVEL_VERBOSE, (" %s short EDID (%u bytes)\n", __FUNCTION__, to_copy));
+        return FALSE;
+    }
+    RtlCopyMemory(edid, resp->edid, to_copy);
+    if (to_copy < EDID_RAW_BLOCK_SIZE)
+    {
+        RtlZeroMemory(edid + to_copy, EDID_RAW_BLOCK_SIZE - to_copy);
+    }
+    if (size)
+    {
+        *size = to_copy;
+    }
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    return TRUE;
+}
+
+BOOLEAN CtrlQueue::AskCapsetInfo(PGPU_VBUFFER *buf, ULONG idx)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_CMD_GET_CASPSET_INFO cmd;
+    PGPU_VBUFFER vbuf;
+    PGPU_RESP_CAPSET_INFO resp_buf;
+    NTSTATUS status;
+
+    if (buf)
+    {
+        *buf = NULL;
+    }
+
+    resp_buf = reinterpret_cast<PGPU_RESP_CAPSET_INFO>(new (NonPagedPoolNx) BYTE[sizeof(GPU_RESP_CAPSET_INFO)]);
+
+    if (!resp_buf)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s Failed allocate %d bytes\n", __FUNCTION__, sizeof(GPU_RESP_CAPSET_INFO)));
+        return FALSE;
+    }
+    cmd = (PGPU_CMD_GET_CASPSET_INFO)AllocCmdResp(&vbuf,
+                                                  sizeof(GPU_CMD_GET_CAPSET_INFO),
+                                                  resp_buf,
+                                                  sizeof(GPU_RESP_CAPSET_INFO));
+    if (!cmd)
+    {
+        delete[] reinterpret_cast<PBYTE>(resp_buf);
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(GPU_CMD_GET_CAPSET_INFO));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+    cmd->capset_index = idx;
+    cmd->padding = 0;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(10000, -10000);
+
+    QueueBuffer(vbuf);
+
+    status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("---> %s timed out capset_idx=%lu status=0x%x\n",
+                  __FUNCTION__,
+                  idx,
+                  status));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        return FALSE;
+    }
+
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+    *buf = vbuf;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return TRUE;
+}
+
+BOOLEAN CtrlQueue::AskCapset(PGPU_VBUFFER *buf, ULONG capset_id, ULONG capset_size, ULONG capset_version)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_CMD_GET_CASPSET cmd;
+    PGPU_VBUFFER vbuf;
+    PGPU_RESP_CAPSET resp_buf;
+    NTSTATUS status;
+    SIZE_T resp_size = (SIZE_T)sizeof(GPU_RESP_CAPSET) + capset_size;
+
+    if (buf)
+    {
+        *buf = NULL;
+    }
+
+    resp_buf = reinterpret_cast<PGPU_RESP_CAPSET>(new (NonPagedPoolNx) BYTE[resp_size]);
+
+    if (!resp_buf)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s Failed allocate %Iu bytes\n", __FUNCTION__, resp_size));
+        return FALSE;
+    }
+    cmd = (PGPU_CMD_GET_CASPSET)AllocCmdResp(&vbuf, sizeof(GPU_CMD_GET_CAPSET), resp_buf, (int)resp_size);
+    if (!cmd)
+    {
+        delete[] reinterpret_cast<PBYTE>(resp_buf);
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(GPU_CMD_GET_CAPSET));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
+    cmd->capset_id = capset_id;
+    cmd->capset_version = capset_version;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(10000, -10000);
+
+    if (QueueBuffer(vbuf) == (UINT)-1)
+    {
+        // Submission failed: QueueBuffer already fired complete_cb (satisfying
+        // the wait) and left this non-auto_release vbuf to us. Drop our wait-ctx
+        // ref, free the vbuf, and report failure instead of returning an
+        // unfilled response (*buf stays NULL).
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s submit failed capset_id=%lu\n", __FUNCTION__, capset_id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, STATUS_SUCCESS);
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+
+    status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out capset_id=%lu\n", __FUNCTION__, capset_id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        return FALSE;
+    }
+
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+    *buf = vbuf;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return TRUE;
+}
+
+void CtrlQueue::CreateResource(UINT res_id, UINT format, UINT width, UINT height)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RES_CREATE_2D cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_CREATE_2D)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_2D;
+    cmd->resource_id = res_id;
+    cmd->format = format;
+    cmd->width = width;
+    cmd->height = height;
+    // FIXME!!! if
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void CtrlQueue::CreateResource3D(UINT res_id, VIOGPU_RESOURCE_3D_OPTIONS *options)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_CMD_RES_CREATE_3D cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_CMD_RES_CREATE_3D)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    cmd->res_id = res_id;
+
+    cmd->target = options->target;
+    cmd->format = options->format;
+    cmd->bind = options->bind;
+    cmd->width = options->width;
+    cmd->height = options->height;
+    cmd->depth = options->depth;
+    cmd->array_size = options->array_size;
+    cmd->last_level = options->last_level;
+    cmd->nr_samples = options->nr_samples;
+
+    // FIXME!!! if
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+bool CtrlQueue::CreateResourceBlob(UINT res_id, UINT ctx_id, VIOGPU_RESOURCE_BLOB_OPTIONS *options, ULONGLONG size)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RES_CREATE_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_CREATE_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_BLOB;
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr/*[ring_idx]*/);
+    cmd->resource_id = res_id;
+    cmd->blob_mem = options->blob_mem;
+    cmd->blob_flags = options->blob_flags;
+    cmd->blob_id = options->blob_id;
+    cmd->size = size;
+
+    // TODO
+    cmd->nr_entries = 0;
+
+    NTSTATUS status;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(10000, -10000);
+
+    QueueBuffer(vbuf);
+
+    status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out res_id=0x%x\n", __FUNCTION__, res_id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        return FALSE;
+    }
+
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+
+    PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)vbuf->resp_buf;
+
+    bool error = resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC;
+
+    ReleaseBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return !error;
+}
+
+void CtrlQueue::CreateCtx(UINT ctx_id, UINT context_init, UCHAR device_name[64])
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_CMD_CTX_CREATE cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_CMD_CTX_CREATE)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->nlen = (ULONG) strnlen_s((const char *) device_name, 64);
+    cmd->context_init = context_init;
+    memcpy(cmd->debug_name, device_name, cmd->nlen);
+
+    // FIXME!!! if
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void CtrlQueue::DestroyCtx(UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_CMD_CTX_DESTROY cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_CMD_CTX_DESTROY)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_CTX_DESTROY;
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr/*[0]*/);
+    cmd->hdr.ctx_id = ctx_id;
+
+    vbuf->complete_cb = complete_cb;
+    vbuf->complete_ctx = complete_ctx;
+
+    // FIXME!!! if
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void CtrlQueue::ResFlush(UINT res_id, UINT width, UINT height, UINT x, UINT y)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+    PGPU_RES_FLUSH cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_FLUSH)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_FLUSH;
+    cmd->resource_id = res_id;
+    cmd->r.width = width;
+    cmd->r.height = height;
+    cmd->r.x = x;
+    cmd->r.y = y;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void CtrlQueue::TransferToHost2D(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+    PGPU_RES_TRANSF_TO_HOST_2D cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_TRANSF_TO_HOST_2D)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    cmd->resource_id = res_id;
+    cmd->offset = offset;
+    cmd->r.width = width;
+    cmd->r.height = height;
+    cmd->r.x = x;
+    cmd->r.y = y;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+// As TransferToHost2D, but returns once the host has answered.
+BOOLEAN CtrlQueue::TransferToHost2DSync(UINT res_id, ULONG offset, UINT width, UINT height, UINT x, UINT y)
+{
+    PAGED_CODE();
+
+    PGPU_RES_TRANSF_TO_HOST_2D cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_TRANSF_TO_HOST_2D)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D;
+    cmd->resource_id = res_id;
+    cmd->offset = offset;
+    cmd->r.width = width;
+    cmd->r.height = height;
+    cmd->r.x = x;
+    cmd->r.y = y;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    if (QueueBuffer(vbuf) == (UINT)-1)
+    {
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, STATUS_UNSUCCESSFUL);
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(1000, -10000); // 1 s
+    NTSTATUS status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out res_id=%u\n", __FUNCTION__, res_id));
+        return FALSE;
+    }
+    ReleaseBuffer(vbuf);
+    return TRUE;
+}
+
+void CtrlQueue::TransferToHost3D(UINT res_id, GPU_BOX *box)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+    PGPU_CMD_TRANSFER_HOST_3D cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_CMD_TRANSFER_HOST_3D)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
+    cmd->resource_id = res_id;
+    cmd->offset = 0;
+    cmd->level = 0;
+    cmd->stride = 0;
+    cmd->layer_stride = 0;
+
+    memcpy(&cmd->box, box, sizeof(GPU_BOX));
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void CtrlQueue::AttachBacking(UINT res_id, PGPU_MEM_ENTRY ents, UINT nents)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RES_ATTACH_BACKING cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_ATTACH_BACKING)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        // The entry array is handed over unconditionally -- on the success
+        // path it is freed with the vbuf, so free it here too rather than
+        // leaking it back to a caller that has already forgotten it.
+        delete[] reinterpret_cast<PBYTE>(ents);
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    cmd->resource_id = res_id;
+    cmd->nr_entries = nents;
+
+    vbuf->data_buf = ents;
+    vbuf->data_size = sizeof(*ents) * nents;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void CtrlQueue::CtxResource(bool attach, UINT ctx_id, UINT res_id)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_CMD_CTX_RESOURCE cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_CMD_CTX_RESOURCE)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = attach ? VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE : VIRTIO_GPU_CMD_CTX_DETACH_RESOURCE;
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr/*[ring_idx]*/);
+    cmd->resource_id = res_id;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+BOOLEAN CtrlQueue::SubmitCommand(void *cmdbuf, ULONG size, ULONG ctx_id, BOOL has_ring, ULONG ring_idx, void (*complete_cb)(void *, void *, void *), void *complete_ctx, BOOLEAN kick)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_CMD_SUBMIT cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_CMD_SUBMIT)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    cmd->size = size;
+
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    if (has_ring) {
+        cmd->hdr.flags |= VIRTIO_GPU_FLAG_RING_IDX;
+        cmd->hdr.ring_idx = (UCHAR) ring_idx;
+    } else {
+        // assert(ring_idx == 0);
+        ring_idx = 0;
+    }
+
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr/*[ring_idx]*/);
+    cmd->hdr.ctx_id = ctx_id;
+
+    vbuf->data_buf = cmdbuf;
+    vbuf->data_size = size;
+
+    vbuf->complete_cb = complete_cb;
+    vbuf->complete_ctx = complete_ctx;
+
+    QueueBuffer(vbuf, kick);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
+}
+
+BOOLEAN CtrlQueue::TransferHostCmd(bool to_host,
+                                   ULONG ctx_id,
+                                   BOOL has_ring,
+                                   ULONG ring_idx,
+                                   VIOGPU_TRANSFER_CMD *options,
+                                   void (*complete_cb)(void *, void *, void *),
+                                   void *complete_ctx)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_CMD_TRANSFER_HOST_3D cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_CMD_TRANSFER_HOST_3D)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = to_host ? VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D : VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+
+    cmd->resource_id = options->res_id;
+
+    cmd->box.x = options->box.x;
+    cmd->box.y = options->box.y;
+    cmd->box.z = options->box.z;
+    cmd->box.width = options->box.width;
+    cmd->box.height = options->box.height;
+    cmd->box.depth = options->box.depth;
+
+    cmd->offset = options->offset;
+    cmd->level = options->level;
+    cmd->stride = options->stride;
+    cmd->layer_stride = options->layer_stride;
+
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    if (has_ring) {
+        cmd->hdr.flags |= VIRTIO_GPU_FLAG_RING_IDX;
+        cmd->hdr.ring_idx = (UCHAR) ring_idx;
+    } else {
+        // assert(ring_idx == 0);
+        ring_idx = 0;
+    }
+
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr/*[ring_idx]*/);
+    cmd->hdr.ctx_id = ctx_id;
+
+    vbuf->complete_cb = complete_cb;
+    vbuf->complete_ctx = complete_ctx;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
+}
+
+BOOLEAN CtrlQueue::ResourceMapBlob(UINT res_id, UINT ctx_id, ULONGLONG offset, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d offset=%llx\n", __FUNCTION__, res_id, offset));
+
+    PGPU_RES_MAP_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_MAP_BLOB)AllocCmdResp(&vbuf, sizeof(*cmd), NULL, sizeof(GPU_RESP_MAP_INFO));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr/*[0]*/);
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->resource_id = res_id;
+    cmd->offset = offset;
+
+    vbuf->complete_cb = complete_cb;
+    vbuf->complete_ctx = complete_ctx;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
+}
+
+// Map a blob's host memory into the hostmem BAR at its placed offset and WAIT
+// for the host to acknowledge it.  The queued ResourceMapBlob only guarantees
+// the command was posted; callers that hand out the window as usable (the
+// RES_INFO placement escape) need the acknowledgement.  Because the control
+// queue is FIFO, the response also proves the resource's CREATE_BLOB was
+// processed, so a ring command may name the res_id as soon as this returns.
+BOOLEAN CtrlQueue::ResourceMapBlobSync(UINT res_id, UINT ctx_id, ULONGLONG offset, ULONG *pMapInfo)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s res_id=%d offset=%llx\n", __FUNCTION__, res_id, offset));
+
+    PGPU_RES_MAP_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_MAP_BLOB)AllocCmdResp(&vbuf, sizeof(*cmd), NULL, sizeof(GPU_RESP_MAP_INFO));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_MAP_BLOB;
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr /*[0]*/);
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->resource_id = res_id;
+    cmd->offset = offset;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    if (QueueBuffer(vbuf) == (UINT)-1)
+    {
+        // Never reached the host; the callback already fired.
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, STATUS_UNSUCCESSFUL);
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(10000, -10000); // 10 s
+    NTSTATUS status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out res_id=%u\n", __FUNCTION__, res_id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        return FALSE;
+    }
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+
+    // A host that answered but refused the map (bad offset, out of memory)
+    // left the window unbacked; success here is what lets the caller latch
+    // Mapped and hand the window out.
+    PGPU_CTRL_HDR resp = (PGPU_CTRL_HDR)vbuf->resp_buf;
+    bool error = resp->type >= VIRTIO_GPU_RESP_ERR_UNSPEC;
+    if (error)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("---> %s host rejected map res_id=%u resp=0x%x\n", __FUNCTION__, res_id, resp->type));
+    }
+    if (pMapInfo != NULL)
+    {
+        *pMapInfo = resp->type == VIRTIO_GPU_RESP_OK_MAP_INFO
+                        ? ((PGPU_RESP_MAP_INFO)vbuf->resp_buf)->map_info & VIRTIO_GPU_MAP_CACHE_MASK
+                        : VIRTIO_GPU_MAP_CACHE_NONE;
+    }
+    ReleaseBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return !error;
+}
+
+BOOLEAN CtrlQueue::ResourceUnmapBlob(UINT res_id, UINT ctx_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RES_UNMAP_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_UNMAP_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr/*[0]*/);
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->resource_id = res_id;
+
+    vbuf->complete_cb = complete_cb;
+    vbuf->complete_ctx = complete_ctx;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
+}
+
+// Unmap a blob's hostmem mapping and WAIT for the host to acknowledge it.
+// The plain ResourceUnmapBlob only queues: a full virtqueue silently fires
+// the completion callback without any host round trip, and the caller
+// cannot tell.  Recycling a BAR window is only safe once the host has
+// actually detached the old mapping -- otherwise the next blob mapped at
+// the same offset aliases the stale one -- so the release-window escape
+// uses this variant and keeps the window on any failure.
+BOOLEAN CtrlQueue::ResourceUnmapBlobSync(UINT res_id, UINT ctx_id)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RES_UNMAP_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_UNMAP_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return FALSE;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNMAP_BLOB;
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr /*[0]*/);
+    cmd->hdr.ctx_id = ctx_id;
+    cmd->resource_id = res_id;
+
+    PVIOGPU_WAIT_CTX waitCtx = VioGpuAllocWaitCtx();
+    if (!waitCtx)
+    {
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+    waitCtx->vbuf = vbuf;
+    InterlockedIncrement(&waitCtx->refCount);
+    vbuf->complete_cb = VioGpuWaitCtxCompleteCB;
+    vbuf->complete_ctx = waitCtx;
+    vbuf->auto_release = false;
+
+    if (QueueBuffer(vbuf) == (UINT)-1)
+    {
+        // Never reached the host; the callback already fired.
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, STATUS_UNSUCCESSFUL);
+        ReleaseBuffer(vbuf);
+        return FALSE;
+    }
+
+    LARGE_INTEGER timeout = {0};
+    timeout.QuadPart = Int32x32To64(10000, -10000); // 10 s
+    NTSTATUS status = KeWaitForSingleObject(&waitCtx->event, Executive, KernelMode, FALSE, &timeout);
+    if (status == STATUS_TIMEOUT)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("---> %s timed out res_id=%u\n", __FUNCTION__, res_id));
+        VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+        return FALSE;
+    }
+    VioGpuWaitCtxFinish(waitCtx, vbuf, this, status);
+    ReleaseBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+    return TRUE;
+}
+
+PAGED_CODE_SEG_END
+
+void CtrlQueue::DestroyResource(UINT res_id, void (*complete_cb)(void *, void *, void *), void *complete_ctx)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RES_UNREF cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_UNREF)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_UNREF;
+    cmd->hdr.flags |= VIRTIO_GPU_FLAG_FENCE;
+    cmd->hdr.fence_id = InterlockedIncrement64(&m_FenceIdr/*[0]*/);
+    cmd->resource_id = res_id;
+
+    vbuf->complete_cb = complete_cb;
+    vbuf->complete_ctx = complete_ctx;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void CtrlQueue::DetachBacking(UINT res_id)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_RES_DETACH_BACKING cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_RES_DETACH_BACKING)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_RESOURCE_DETACH_BACKING;
+    cmd->resource_id = res_id;
+
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+PVOID CtrlQueue::AllocCmdResp(PGPU_VBUFFER *buf, int cmd_sz, PVOID resp_buf, int resp_sz)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_VBUFFER vbuf;
+    vbuf = m_pBuf->GetBuf(cmd_sz, resp_sz, resp_buf);
+    *buf = vbuf;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return vbuf ? vbuf->buf : NULL;
+}
+
+PVOID CtrlQueue::AllocCmd(PGPU_VBUFFER *buf, int sz)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    if (buf == NULL || sz == 0)
+    {
+        return NULL;
+    }
+
+    PGPU_VBUFFER vbuf = m_pBuf->GetBuf(sz, sizeof(GPU_CTRL_HDR), NULL);
+    *buf = vbuf;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s  vbuf = %p\n", __FUNCTION__, vbuf));
+
+    return vbuf ? vbuf->buf : NULL;
+}
+
+void CtrlQueue::SetScanout(UINT scan_id, UINT res_id, UINT width, UINT height, UINT x, UINT y)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_SET_SCANOUT cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_SET_SCANOUT)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT;
+    cmd->resource_id = res_id;
+    cmd->scanout_id = scan_id;
+    cmd->r.width = width;
+    cmd->r.height = height;
+    cmd->r.x = x;
+    cmd->r.y = y;
+
+    // FIXME if
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+void CtrlQueue::SetScanoutBlob(UINT scan_id, UINT res_id, GPU_RECT rect, VIOGPU_BLOB_INFO info)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_SET_SCANOUT_BLOB cmd;
+    PGPU_VBUFFER vbuf;
+    cmd = (PGPU_SET_SCANOUT_BLOB)AllocCmd(&vbuf, sizeof(*cmd));
+    if (!cmd)
+    {
+        return;
+    }
+    RtlZeroMemory(cmd, sizeof(*cmd));
+
+    cmd->hdr.type = VIRTIO_GPU_CMD_SET_SCANOUT_BLOB;
+    cmd->resource_id = res_id;
+    cmd->scanout_id = scan_id;
+    cmd->r = rect;
+    cmd->width = info.width;
+    cmd->height = info.height;
+    cmd->format = info.format;
+    for (UINT i = 0; i < 4; i++) {
+        cmd->strides[i] = info.strides[i];
+        cmd->offsets[i] = info.offsets[i];
+    }
+
+    // FIXME if
+    QueueBuffer(vbuf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+#define SGLIST_SIZE 256
+// Build the descriptor list describing a vbuf's command, data, and response
+// buffers.  FALSE means the vbuf exceeds a hard limit (the PAGE_SIZE caps or
+// SGLIST_SIZE) and can never be submitted.  Deterministic in the vbuf's
+// fields, so a list that built here rebuilds identically when a parked vbuf
+// is resubmitted by SubmitPendingLocked.
+static BOOLEAN BuildVbufSGList(PGPU_VBUFFER buf, VirtIOBufferDescriptor sg[], UINT *poutcnt, UINT *pincnt)
+{
+    UINT sgleft = SGLIST_SIZE;
+    UINT outcnt = 0, incnt = 0;
+
+    if (buf->size > PAGE_SIZE)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s size is too big %d\n", __FUNCTION__, buf->size));
+        return FALSE;
+    }
+
+    if (BuildSGElement(&sg[outcnt + incnt], (PVOID)buf->buf, buf->size))
+    {
+        outcnt++;
+        sgleft--;
+    }
+
+    if (buf->data_size)
+    {
+        ULONG data_size = buf->data_size;
+        PVOID data_buf = (PVOID)buf->data_buf;
+        while (data_size)
+        {
+            if (BuildSGElement(&sg[outcnt + incnt], data_buf, data_size))
+            {
+                data_buf = (PVOID)((LONG_PTR)(data_buf) + PAGE_SIZE);
+                data_size -= min(data_size, PAGE_SIZE);
+                outcnt++;
+                sgleft--;
+                if (sgleft == 0)
+                {
+                    DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s no more sgelenamt spots left %d\n", __FUNCTION__, outcnt));
+                    return FALSE;
+                }
+            }
+        }
+    }
+
+    if (buf->resp_size > PAGE_SIZE)
+    {
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--> %s resp_size is too big %d\n", __FUNCTION__, buf->resp_size));
+        return FALSE;
+    }
+
+    if (buf->resp_size && (sgleft > 0))
+    {
+        if (BuildSGElement(&sg[outcnt + incnt], (PVOID)buf->resp_buf, buf->resp_size))
+        {
+            incnt++;
+            sgleft--;
+        }
+    }
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--> %s sgleft %d\n", __FUNCTION__, sgleft));
+
+    *poutcnt = outcnt;
+    *pincnt = incnt;
+    return TRUE;
+}
+
+UINT CtrlQueue::QueueBuffer(PGPU_VBUFFER buf, BOOLEAN kick)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    VirtIOBufferDescriptor sg[SGLIST_SIZE];
+    UINT outcnt = 0, incnt = 0;
+    KIRQL SavedIrql;
+
+    if (!BuildVbufSGList(buf, sg, &outcnt, &incnt))
+    {
+        // Don't leak the fence: fire the completion callback and release the
+        // vbuf (mirroring the AddBuf-failure arm) so the owning command
+        // advances and dxgkrnl sees the fence retire instead of timing the
+        // engine out (VidSchWaitForCompletionEvent TDR).
+        if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
+        {
+            buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
+        }
+        if (buf->auto_release)
+        {
+            ReleaseBuffer(buf);
+        }
+        // A previously deferred (kick=FALSE) buffer must not be stranded by
+        // this one's failure.
+        FlushKick();
+        return 0;
+    }
+
+    int rc = 0;
+    BOOLEAN pended = FALSE;
+
+    Lock(&SavedIrql);
+    if (!IsListEmpty(&m_PendingBufs) && IsActive())
+    {
+        // Older commands are already parked waiting for ring space; see
+        // m_PendingBufs -- adding directly would overtake them.
+        InsertTailList(&m_PendingBufs, &buf->pending_entry);
+        pended = TRUE;
+        if (kick)
+        {
+            Kick();
+        }
+    }
+    else
+    {
+        rc = AddBuf(&sg[0], outcnt, incnt, buf, NULL, 0);
+        if (rc < 0 && rc != -1 && outcnt + incnt <= GetQueueSize())
+        {
+            // -ENOSPC on a live queue: every descriptor is held by an
+            // in-flight command.  Dropping the command here desynchronizes
+            // guest and host state -- the failure arm below completes the
+            // buffer locally, so to its caller a dropped command is
+            // indistinguishable from an executed one (a dropped
+            // RESOURCE_MAP_BLOB, for instance, leaves the UMD writing
+            // through a BAR window no host mapping backs).  Park it
+            // instead: the response DPC frees descriptors under this same
+            // lock (DequeueBuffer) and resubmits in FIFO order, and since
+            // -ENOSPC was observed under the lock those in-flight
+            // responses are still owed, so a drain pass is guaranteed.
+            // Excluded: a closed queue (AddBuf's -1, no space ever coming)
+            // and a command needing more descriptors than the whole ring
+            // holds, which no amount of draining can satisfy -- both fall
+            // through to the local completion below.
+            InsertTailList(&m_PendingBufs, &buf->pending_entry);
+            pended = TRUE;
+        }
+        // Deferred-kick batching (kick=FALSE): the caller queues several
+        // buffers for one DMA body and kicks once at the end -- each kick
+        // is an MMIO VM exit.  On AddBuf failure kick anyway so a
+        // previously deferred buffer is never stranded behind this one's
+        // failure.
+        if (kick || rc < 0)
+        {
+            Kick();
+        }
+    }
+    Unlock(SavedIrql);
+
+    if (pended)
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("<--> %s ring full, parked vbuf %p\n", __FUNCTION__, buf));
+        return 0;
+    }
+
+    if (rc < 0)
+    {
+        // Submission failed (queue closed, or the command can never fit).
+        // The vbuf is sitting on m_InUseBufs from AllocCmd but will never be
+        // dequeued, so fire the callback to unblock any waiter -- exactly the
+        // completion path's contract. Release the vbuf here only when it is
+        // auto_release, mirroring DpcRoutine: a synchronous caller
+        // (auto_release == false) owns the vbuf and frees it once the callback
+        // unblocks its wait, so releasing it here too would double-free it.
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<--> %s AddBuf failed rc=%d; firing complete_cb\n",
+                  __FUNCTION__, rc));
+        if (buf->complete_cb &&
+            InterlockedExchange(&buf->complete_fired, 1) == 0)
+        {
+            buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
+        }
+        if (buf->auto_release)
+        {
+            ReleaseBuffer(buf);
+        }
+        return (UINT)-1;
+    }
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s ret = %d\n", __FUNCTION__, rc));
+
+    return (UINT)rc;
+}
+
+// Resubmit parked vbufs in FIFO order.  Called with the queue lock held,
+// after GetBuf has just reclaimed descriptors.  Stops at the first vbuf
+// that still does not fit; the next response's drain pass retries.
+void CtrlQueue::SubmitPendingLocked()
+{
+    VirtIOBufferDescriptor sg[SGLIST_SIZE];
+    BOOLEAN added = FALSE;
+
+    while (!IsListEmpty(&m_PendingBufs))
+    {
+        PGPU_VBUFFER buf = CONTAINING_RECORD(m_PendingBufs.Flink, GPU_VBUFFER, pending_entry);
+        UINT outcnt = 0, incnt = 0;
+
+        // Cannot fail: the vbuf built successfully when it was parked and
+        // BuildVbufSGList is deterministic in the vbuf's fields.
+        BuildVbufSGList(buf, sg, &outcnt, &incnt);
+        if (AddBuf(&sg[0], outcnt, incnt, buf, NULL, 0) < 0)
+        {
+            break;
+        }
+        RemoveHeadList(&m_PendingBufs);
+        added = TRUE;
+    }
+    if (added)
+    {
+        Kick();
+    }
+}
+
+PGPU_VBUFFER CtrlQueue::DequeueBuffer(_Out_ UINT *len)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_VBUFFER buf = NULL;
+    KIRQL SavedIrql;
+    Lock(&SavedIrql);
+    buf = (PGPU_VBUFFER)GetBuf(len);
+    if (buf != NULL && !IsListEmpty(&m_PendingBufs))
+    {
+        // GetBuf freed this response's descriptors; parked commands may
+        // fit now.
+        SubmitPendingLocked();
+    }
+    Unlock(SavedIrql);
+    if (buf == NULL)
+    {
+        *len = 0;
+    }
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return buf;
+}
+
+void CtrlQueue::Close(void)
+{
+    VioGpuQueue::Close();
+
+    // The virtqueue is gone, so no drain pass will ever resubmit the
+    // parked vbufs: complete them locally under the same contract as
+    // QueueBuffer's failure arm so their waiters unblock.  QueueBuffer
+    // parks only while IsActive(), so nothing is added behind this drain.
+    LIST_ENTRY parked;
+    InitializeListHead(&parked);
+    KIRQL SavedIrql;
+
+    Lock(&SavedIrql);
+    while (!IsListEmpty(&m_PendingBufs))
+    {
+        InsertTailList(&parked, RemoveHeadList(&m_PendingBufs));
+    }
+    Unlock(SavedIrql);
+
+    // Callbacks fire outside the queue lock: they wake waiters and may
+    // release buffers.
+    while (!IsListEmpty(&parked))
+    {
+        PGPU_VBUFFER buf = CONTAINING_RECORD(RemoveHeadList(&parked), GPU_VBUFFER, pending_entry);
+
+        if (buf->complete_cb && InterlockedExchange(&buf->complete_fired, 1) == 0)
+        {
+            buf->complete_cb(buf->complete_ctx, buf->buf, buf->resp_buf);
+        }
+        if (buf->auto_release)
+        {
+            ReleaseBuffer(buf);
+        }
+    }
+}
+
+void VioGpuQueue::ReleaseBuffer(PGPU_VBUFFER buf)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    m_pBuf->FreeBuf(buf);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+BOOLEAN VioGpuBuf::Init(_In_ UINT cnt)
+{
+    KIRQL OldIrql;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    m_uCountMin = cnt;
+
+    for (UINT i = 0; i < cnt; ++i)
+    {
+        PGPU_VBUFFER pvbuf = reinterpret_cast<PGPU_VBUFFER>(new (NonPagedPoolNx) BYTE[VBUFFER_SIZE]);
+        if (!pvbuf)
+        {
+            DbgPrint(TRACE_LEVEL_ERROR,
+                     ("%s failed to allocate vbuf %u of %u\n", __FUNCTION__, i, cnt));
+            continue;
+        }
+        RtlZeroMemory(pvbuf, VBUFFER_SIZE);
+        KeAcquireSpinLock(&m_SpinLock, &OldIrql);
+        InsertTailList(&m_FreeBufs, &pvbuf->list_entry);
+        ++m_uCount;
+        KeReleaseSpinLock(&m_SpinLock, OldIrql);
+    }
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s count=%u/%u\n", __FUNCTION__, m_uCount, cnt));
+
+    return (m_uCount > 0);
+}
+
+void VioGpuBuf::Close(void)
+{
+    KIRQL OldIrql;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    // Drain in-use vbufs first: fire each callback so any sync caller
+    // (Ask*, CreateResourceBlob) waiting on a wait-context wakes up
+    // and unwinds, rather than blocking on a vbuf that the host can
+    // no longer respond to. Collect under the lock, then process
+    // outside it so callbacks that take other locks (e.g. the queue
+    // lock during ReleaseBuffer) don't deadlock.
+    LIST_ENTRY drained;
+    InitializeListHead(&drained);
+
+    KeAcquireSpinLock(&m_SpinLock, &OldIrql);
+    while (!IsListEmpty(&m_InUseBufs))
+    {
+        PLIST_ENTRY entry = RemoveHeadList(&m_InUseBufs);
+        InsertTailList(&drained, entry);
+    }
+    KeReleaseSpinLock(&m_SpinLock, OldIrql);
+
+    while (!IsListEmpty(&drained))
+    {
+        PLIST_ENTRY entry = RemoveHeadList(&drained);
+        PGPU_VBUFFER pvbuf = CONTAINING_RECORD(entry, GPU_VBUFFER, list_entry);
+
+        if (pvbuf->complete_cb &&
+            InterlockedExchange(&pvbuf->complete_fired, 1) == 0)
+        {
+            pvbuf->complete_cb(pvbuf->complete_ctx, pvbuf->buf, pvbuf->resp_buf);
+        }
+
+        if (pvbuf->resp_buf && pvbuf->resp_size > MAX_INLINE_RESP_SIZE)
+        {
+            delete[] reinterpret_cast<PBYTE>(pvbuf->resp_buf);
+            pvbuf->resp_buf = NULL;
+            pvbuf->resp_size = 0;
+        }
+        if (pvbuf->data_buf && pvbuf->data_size)
+        {
+            delete[] reinterpret_cast<PBYTE>(pvbuf->data_buf);
+            pvbuf->data_buf = NULL;
+            pvbuf->data_size = 0;
+        }
+
+        KeAcquireSpinLock(&m_SpinLock, &OldIrql);
+        delete[] reinterpret_cast<PBYTE>(pvbuf);
+        --m_uCount;
+        KeReleaseSpinLock(&m_SpinLock, OldIrql);
+    }
+
+    KeAcquireSpinLock(&m_SpinLock, &OldIrql);
+
+    while (!IsListEmpty(&m_FreeBufs))
+    {
+        LIST_ENTRY *pListItem = RemoveHeadList(&m_FreeBufs);
+        if (pListItem)
+        {
+            PGPU_VBUFFER pbuf = CONTAINING_RECORD(pListItem, GPU_VBUFFER, list_entry);
+            ASSERT(pbuf);
+
+            if (pbuf->resp_buf && pbuf->resp_size > MAX_INLINE_RESP_SIZE)
+            {
+                delete[] reinterpret_cast<PBYTE>(pbuf->resp_buf);
+                pbuf->resp_buf = NULL;
+                pbuf->resp_size = 0;
+            }
+
+            if (pbuf->data_buf && pbuf->data_size)
+            {
+                delete[] reinterpret_cast<PBYTE>(pbuf->data_buf);
+                pbuf->data_buf = NULL;
+                pbuf->data_size = 0;
+            }
+
+            delete[] reinterpret_cast<PBYTE>(pbuf);
+            --m_uCount;
+        }
+    }
+    KeReleaseSpinLock(&m_SpinLock, OldIrql);
+
+    ASSERT(m_uCount == 0);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+PGPU_VBUFFER VioGpuBuf::GetBuf(_In_ int size, _In_ int resp_size, _In_opt_ void *resp_buf)
+{
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_VBUFFER pbuf = NULL;
+    PLIST_ENTRY pListItem = NULL;
+    KIRQL SavedIrql = KeGetCurrentIrql();
+
+    if (SavedIrql < DISPATCH_LEVEL)
+    {
+        KeAcquireSpinLock(&m_SpinLock, &SavedIrql);
+    }
+    else if (SavedIrql == DISPATCH_LEVEL)
+    {
+        KeAcquireSpinLockAtDpcLevel(&m_SpinLock);
+    }
+    else
+    {
+        VioGpuDbgBreak();
+    }
+
+    if (IsListEmpty(&m_FreeBufs))
+    {
+        pbuf = reinterpret_cast<PGPU_VBUFFER>(new (NonPagedPoolNx) BYTE[VBUFFER_SIZE]);
+        if (pbuf)
+        {
+            ++m_uCount;
+        }
+    }
+    else
+    {
+        pListItem = RemoveHeadList(&m_FreeBufs);
+        pbuf = CONTAINING_RECORD(pListItem, GPU_VBUFFER, list_entry);
+    }
+
+    if (!pbuf)
+    {
+        if (SavedIrql < DISPATCH_LEVEL)
+        {
+            KeReleaseSpinLock(&m_SpinLock, SavedIrql);
+        }
+        else
+        {
+            KeReleaseSpinLockFromDpcLevel(&m_SpinLock);
+        }
+        DbgPrint(TRACE_LEVEL_ERROR, ("<--- %s allocation failed\n", __FUNCTION__));
+        return NULL;
+    }
+
+    if (size > MAX_INLINE_CMD_SIZE)
+    {
+        // Runtime guard for callers that grow the command size; the
+        // inline cmd buffer cannot hold it. Return the vbuf to the
+        // free list and fail cleanly instead of corrupting the next
+        // buffer.
+        DbgPrint(TRACE_LEVEL_ERROR,
+                 ("<--- %s command size %d exceeds inline max %d\n",
+                  __FUNCTION__, size, MAX_INLINE_CMD_SIZE));
+        if (pListItem)
+        {
+            InsertHeadList(&m_FreeBufs, &pbuf->list_entry);
+        }
+        else
+        {
+            delete[] reinterpret_cast<PBYTE>(pbuf);
+            --m_uCount;
+        }
+        if (SavedIrql < DISPATCH_LEVEL)
+        {
+            KeReleaseSpinLock(&m_SpinLock, SavedIrql);
+        }
+        else
+        {
+            KeReleaseSpinLockFromDpcLevel(&m_SpinLock);
+        }
+        return NULL;
+    }
+    memset(pbuf, 0, VBUFFER_SIZE);
+
+    pbuf->buf = (char *)((ULONG_PTR)pbuf + sizeof(*pbuf));
+    pbuf->size = size;
+    pbuf->auto_release = true;
+
+    pbuf->resp_size = resp_size;
+    if (resp_size <= MAX_INLINE_RESP_SIZE)
+    {
+        pbuf->resp_buf = (char *)((ULONG_PTR)pbuf->buf + size);
+    }
+    else
+    {
+        pbuf->resp_buf = (char *)resp_buf;
+    }
+    ASSERT(pbuf->resp_buf);
+    InsertTailList(&m_InUseBufs, &pbuf->list_entry);
+
+    if (SavedIrql < DISPATCH_LEVEL)
+    {
+        KeReleaseSpinLock(&m_SpinLock, SavedIrql);
+    }
+    else if (SavedIrql == DISPATCH_LEVEL)
+    {
+        KeReleaseSpinLockFromDpcLevel(&m_SpinLock);
+    }
+    else
+    {
+        VioGpuDbgBreak();
+    }
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s buf = %p\n", __FUNCTION__, pbuf));
+
+    return pbuf;
+}
+
+void VioGpuBuf::FreeBuf(_In_ PGPU_VBUFFER pbuf)
+{
+    KIRQL OldIrql;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s buf = %p\n", __FUNCTION__, pbuf));
+    KeAcquireSpinLock(&m_SpinLock, &OldIrql);
+
+    // Membership check: only proceed with the free if pbuf was actually
+    // on the in-use list. A double-Free would otherwise double-delete
+    // resp_buf / data_buf and re-insert the vbuf into m_FreeBufs (or
+    // double-delete the vbuf itself), corrupting later allocations.
+    BOOLEAN found = FALSE;
+    PLIST_ENTRY leCurrent = m_InUseBufs.Flink;
+    while (leCurrent != &m_InUseBufs)
+    {
+        PGPU_VBUFFER pvbuf = CONTAINING_RECORD(leCurrent, GPU_VBUFFER, list_entry);
+        if (pvbuf == pbuf)
+        {
+            RemoveEntryList(leCurrent);
+            found = TRUE;
+            break;
+        }
+        leCurrent = leCurrent->Flink;
+    }
+
+    if (!found)
+    {
+        KeReleaseSpinLock(&m_SpinLock, OldIrql);
+        // pbuf is not on the in-use list: a second Free of an already-freed
+        // vbuf. The membership check above makes this a safe no-op -- the vbuf
+        // and its resp_buf/data_buf are NOT double-deleted and the free list is
+        // not corrupted. A fatal ASSERT here would fire from the completion DPC
+        // (the auto_release arm) and halt the DPC thread, so no further DMA
+        // completions reach dxgkrnl -- the GPU scheduler then times the engine
+        // out (dxgmms1!VidSchWaitForCompletionEvent) with an idle engine
+        // (submitted==completed) and TDRs / hangs the guest. Return without the
+        // fatal assert.
+        return;
+    }
+
+    if (pbuf->resp_buf && pbuf->resp_size > MAX_INLINE_RESP_SIZE)
+    {
+        delete[] reinterpret_cast<PBYTE>(pbuf->resp_buf);
+        pbuf->resp_buf = NULL;
+        pbuf->resp_size = 0;
+    }
+
+    if (pbuf->data_buf && pbuf->data_size)
+    {
+        delete[] reinterpret_cast<PBYTE>(pbuf->data_buf);
+        pbuf->data_buf = NULL;
+        pbuf->data_size = 0;
+    }
+
+    if (m_uCount > m_uCountMin)
+    {
+        delete[] reinterpret_cast<PBYTE>(pbuf);
+        --m_uCount;
+    }
+    else
+    {
+        InsertTailList(&m_FreeBufs, &pbuf->list_entry);
+    }
+
+    KeReleaseSpinLock(&m_SpinLock, OldIrql);
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+PAGED_CODE_SEG_BEGIN
+VioGpuBuf::VioGpuBuf()
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    InitializeListHead(&m_FreeBufs);
+    InitializeListHead(&m_InUseBufs);
+    KeInitializeSpinLock(&m_SpinLock);
+    m_uCount = 0;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+VioGpuBuf::~VioGpuBuf()
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_FATAL, ("---> %s 0x%p\n", __FUNCTION__, this));
+
+    Close();
+
+    DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s\n", __FUNCTION__));
+}
+
+VioGpuMemSegment::VioGpuMemSegment(void)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    m_pSGList = NULL;
+    m_pVAddr = NULL;
+    m_pMdl = NULL;
+    m_bSystemMemory = FALSE;
+    m_bMapped = FALSE;
+    m_Size = 0;
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+VioGpuMemSegment::~VioGpuMemSegment(void)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    Close();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+BOOLEAN VioGpuMemSegment::Init(_In_ UINT size, _In_opt_ PPHYSICAL_ADDRESS pPAddr)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    ASSERT(size);
+    PVOID buf = NULL;
+    UINT pages = BYTES_TO_PAGES(size);
+    UINT sglsize = sizeof(SCATTER_GATHER_LIST) + (sizeof(SCATTER_GATHER_ELEMENT) * pages);
+    size = pages * PAGE_SIZE;
+
+    DbgPrint(TRACE_LEVEL_WARNING,
+             ("%s mapping 0x%llx - %u\n", __FUNCTION__, pPAddr ? pPAddr->QuadPart : 0LL, size));
+
+    if ((pPAddr == NULL) || pPAddr->QuadPart == 0LL)
+    {
+        m_pVAddr = new (NonPagedPoolNx) BYTE[size];
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s using malloc\n", __FUNCTION__));
+
+        if (!m_pVAddr)
+        {
+            DbgPrint(TRACE_LEVEL_FATAL, ("%s insufficient resources to allocate %x bytes\n", __FUNCTION__, size));
+            return FALSE;
+        }
+        RtlZeroMemory(m_pVAddr, size);
+        m_bSystemMemory = TRUE;
+    }
+    else
+    {
+        DbgPrint(TRACE_LEVEL_WARNING, ("%s using physical memory\n", __FUNCTION__));
+
+        NTSTATUS Status = MapFrameBuffer(*pPAddr, size, &m_pVAddr);
+        if (!NT_SUCCESS(Status))
+        {
+            DbgPrint(TRACE_LEVEL_FATAL, ("<--- %s MapFrameBuffer failed with Status: 0x%X\n", __FUNCTION__, Status));
+            return FALSE;
+        }
+        m_bMapped = TRUE;
+    }
+    // Close() releases the allocation or the mapping by m_Size, so it has to
+    // describe them from the moment they exist, not only once Init succeeds.
+    m_Size = size;
+
+    m_pMdl = IoAllocateMdl(m_pVAddr, size, FALSE, FALSE, NULL);
+    if (!m_pMdl)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL, ("%s insufficient resources to allocate MDLs\n", __FUNCTION__));
+        Close();
+        return FALSE;
+    }
+    if (m_bSystemMemory == TRUE)
+    {
+        __try
+        {
+            MmProbeAndLockPages(m_pMdl, KernelMode, IoWriteAccess);
+        }
+#pragma prefast(suppress : __WARNING_EXCEPTIONEXECUTEHANDLER, "try/except is only able to protect against user-mode errors and these are the only errors we try to catch here");
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            DbgPrint(TRACE_LEVEL_FATAL, ("%s Failed to lock pages with error %x\n", __FUNCTION__, GetExceptionCode()));
+            // Nothing is locked, so Close() must neither unlock the pages nor
+            // free the MDL a second time.
+            IoFreeMdl(m_pMdl);
+            m_pMdl = NULL;
+            Close();
+            return FALSE;
+        }
+    }
+    m_pSGList = reinterpret_cast<PSCATTER_GATHER_LIST>(new (NonPagedPoolNx) BYTE[sglsize]);
+    if (!m_pSGList)
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("%s insufficient resources to allocate a %u byte scatter-gather list\n", __FUNCTION__, sglsize));
+        Close();
+        return FALSE;
+    }
+
+    RtlZeroMemory(m_pSGList, sglsize);
+    buf = PAGE_ALIGN(m_pVAddr);
+
+    for (UINT i = 0; i < pages; ++i)
+    {
+        PHYSICAL_ADDRESS pa = {0};
+        ASSERT(MmIsAddressValid(buf));
+        pa = MmGetPhysicalAddress(buf);
+        if (pa.QuadPart == 0LL)
+        {
+            DbgPrint(TRACE_LEVEL_FATAL, ("%s Invalid PA buf = %p element %d\n", __FUNCTION__, buf, i));
+            break;
+        }
+        m_pSGList->Elements[i].Address = pa;
+        m_pSGList->Elements[i].Length = PAGE_SIZE;
+        buf = (PVOID)((LONG_PTR)(buf) + PAGE_SIZE);
+        m_pSGList->NumberOfElements++;
+    }
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return TRUE;
+}
+
+PHYSICAL_ADDRESS VioGpuMemSegment::GetPhysicalAddress(void)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PHYSICAL_ADDRESS pa = {0};
+    if (m_pVAddr && MmIsAddressValid(m_pVAddr))
+    {
+        pa = MmGetPhysicalAddress(m_pVAddr);
+    }
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+
+    return pa;
+}
+
+void VioGpuMemSegment::Close(void)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    if (m_pMdl)
+    {
+        if (m_bSystemMemory)
+        {
+            MmUnlockPages(m_pMdl);
+        }
+        IoFreeMdl(m_pMdl);
+        m_pMdl = NULL;
+    }
+
+    if (m_bSystemMemory)
+    {
+        delete[] m_pVAddr;
+    }
+    else if (m_pVAddr)
+    {
+        UnmapFrameBuffer(m_pVAddr, (ULONG)m_Size);
+    }
+    m_bMapped = FALSE;
+    m_pVAddr = NULL;
+
+    delete[] reinterpret_cast<PBYTE>(m_pSGList);
+    m_pSGList = NULL;
+
+    // A closed segment must describe no memory: this object is reused across a
+    // HWClose/HWInit pair, and GetSize() gates VioGpuObj::Init.
+    m_bSystemMemory = FALSE;
+    m_Size = 0;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+VioGpuObj::VioGpuObj(void)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    m_uiHwRes = 0;
+    m_pSegment = NULL;
+    m_Size = 0;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+VioGpuObj::~VioGpuObj(void)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s\n", __FUNCTION__));
+}
+
+BOOLEAN VioGpuObj::Init(_In_ UINT size, VioGpuMemSegment *pSegment)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s requested size = %d\n", __FUNCTION__, size));
+
+    ASSERT(size);
+    ASSERT(pSegment);
+    UINT pages = BYTES_TO_PAGES(size);
+    size = pages * PAGE_SIZE;
+    if (size > pSegment->GetSize())
+    {
+        DbgPrint(TRACE_LEVEL_FATAL,
+                 ("<--- %s segment size too small = %Iu (%u)\n", __FUNCTION__, pSegment->GetSize(), size));
+        return FALSE;
+    }
+    m_pSegment = pSegment;
+    m_Size = size;
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s size = %Iu\n", __FUNCTION__, m_Size));
+    return TRUE;
+}
+
+PVOID CrsrQueue::AllocCursor(PGPU_VBUFFER *buf)
+{
+    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_VBUFFER vbuf;
+    vbuf = m_pBuf->GetBuf(sizeof(GPU_UPDATE_CURSOR), 0, NULL);
+    ASSERT(vbuf);
+    *buf = vbuf;
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s  vbuf = %p\n", __FUNCTION__, vbuf));
+
+    return vbuf ? vbuf->buf : NULL;
+}
+
+PAGED_CODE_SEG_END
+
+UINT CrsrQueue::QueueCursor(PGPU_VBUFFER buf)
+{
+    //    PAGED_CODE();
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    UINT res = 0;
+    KIRQL SavedIrql;
+
+    VirtIOBufferDescriptor sg[1];
+    int outcnt = 0;
+
+    ASSERT(buf->size <= PAGE_SIZE);
+    if (BuildSGElement(&sg[outcnt], (PVOID)buf->buf, buf->size))
+    {
+        outcnt++;
+    }
+
+    ASSERT(outcnt);
+    Lock(&SavedIrql);
+    int rc = AddBuf(&sg[0], outcnt, 0, buf, NULL, 0);
+    Kick();
+    Unlock(SavedIrql);
+    if (rc < 0)
+    {
+        ReleaseBuffer(buf);
+        res = (UINT)-1;
+    }
+
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s vbuf = %p outcnt = %d, rc = %d\n", __FUNCTION__, buf, outcnt, rc));
+    return res;
+}
+
+PGPU_VBUFFER CrsrQueue::DequeueCursor(_Out_ UINT *len)
+{
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("---> %s\n", __FUNCTION__));
+
+    PGPU_VBUFFER buf = NULL;
+    KIRQL SavedIrql;
+    Lock(&SavedIrql);
+    buf = (PGPU_VBUFFER)GetBuf(len);
+    Unlock(SavedIrql);
+    if (buf == NULL)
+    {
+        *len = 0;
+    }
+    DbgPrint(TRACE_LEVEL_VERBOSE, ("<--- %s buf %p len = %u\n", __FUNCTION__, buf, *len));
+    return buf;
+}

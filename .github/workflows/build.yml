@@ -1,0 +1,87 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  usermode:
+    name: User mode (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: cachix/install-nix-action@v31
+      - run: nix develop -c make ${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: usermode-${{ matrix.arch }}
+          path: out/${{ matrix.arch }}
+          if-no-files-found: error
+
+  package:
+    name: Driver and installer
+    needs: usermode
+    # windows-2022 has Visual Studio 2022 with the WDK and NSIS.
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - uses: actions/download-artifact@v4
+        with:
+          name: usermode-x64
+          path: out/x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: usermode-x86
+          path: out/x86
+      - run: msbuild installer/package.proj -nologo -v:minimal -p:BuildNumber=${{ github.run_number }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loophole-guest
+          path: out/package
+          if-no-files-found: error
+
+  # loophole downloads loophole-guest.iso from the latest release (Actions artifacts need a
+  # token to download).
+  release:
+    name: Release
+    needs: package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: loophole-guest
+          path: out/package
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends xorriso
+      - name: Disc and driver package
+        run: |
+          make iso
+          (cd out/package/drivers && zip -qr ../../viogpu3d-package.zip .)
+      - name: Publish build-${{ github.run_number }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" \
+            out/loophole-guest.iso out/package/loophole-setup.exe out/viogpu3d-package.zip \
+            --target "${{ github.sha }}" --latest \
+            --title "loophole-guest build ${{ github.run_number }}" \
+            --notes "Driver $(cat out/package/version.txt) from ${{ github.sha }}."

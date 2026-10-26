@@ -1,0 +1,15 @@
+[submodule "third_party/mesa"]
+	path = third_party/mesa
+	url = https://github.com/kossLAN/mesa.git
+	branch = loophole
+	shallow = true
+[submodule "third_party/dxvk"]
+	path = third_party/dxvk
+	url = https://github.com/kossLAN/dxvk.git
+	branch = loophole
+	shallow = true
+[submodule "third_party/vkd3d-proton"]
+	path = third_party/vkd3d-proton
+	url = https://github.com/kossLAN/vkd3d-proton.git
+	branch = loophole
+	shallow = true

@@ -1,0 +1,101 @@
+[Version]
+Signature   = "$Windows NT$"
+Class       = Display
+ClassGUID   = {4d36e968-e325-11ce-bfc1-08002be10318}
+Provider    = %Provider%
+; installer\package.proj stamps the date and version.
+DriverVer   = 01/01/2026, 1.0.0.0
+CatalogFile = viogpu3d.cat
+PnpLockdown = 1
+
+[DestinationDirs]
+VioGpu3D_Files.Driver = 13
+VioGpu3D_Files.UserMode = 13
+
+[SourceDisksNames]
+1 = %DiskId1%,,,""
+
+[SourceDisksFiles]
+viogpu3d.sys = 1,,
+loophole_umd.dll = 1,,
+loophole_dxgi.dll = 1,,
+loophole_d3d11.dll = 1,,
+loophole_d3d12core.dll = 1,,
+vulkan_radeon.dll = 1,,
+radeon_icd.json = 1,,
+loophole32_umd.dll = 1,,
+loophole32_dxgi.dll = 1,,
+loophole32_d3d11.dll = 1,,
+loophole32_d3d12core.dll = 1,,
+vulkan_radeon32.dll = 1,,
+radeon_icd32.json = 1,,
+
+[Manufacturer]
+%Provider% = Loophole,NTamd64
+
+[Loophole.NTamd64]
+%VioGpu3D.DeviceDesc% = VioGpu3D_Inst, PCI\VEN_1AF4&DEV_1050&CC_0300
+
+[VioGpu3D_Files.Driver]
+viogpu3d.sys,,,2
+
+[VioGpu3D_Files.UserMode]
+loophole_umd.dll,,,2
+loophole_dxgi.dll,,,2
+loophole_d3d11.dll,,,2
+loophole_d3d12core.dll,,,2
+vulkan_radeon.dll,,,2
+radeon_icd.json,,,2
+loophole32_umd.dll,,,2
+loophole32_dxgi.dll,,,2
+loophole32_d3d11.dll,,,2
+loophole32_d3d12core.dll,,,2
+vulkan_radeon32.dll,,,2
+radeon_icd32.json,,,2
+
+[VioGpu3D_Inst]
+Include     = msdv.inf
+FeatureScore = F9
+CopyFiles   = VioGpu3D_Files.Driver, VioGpu3D_Files.UserMode
+AddReg      = VioGpu3D_DeviceSettings
+
+[VioGpu3D_Inst.Services]
+AddService = VioGpu3D,0x00000002,VioGpu3D_Service_Inst,VioGpu3D_EventLog_Inst
+
+[VioGpu3D_Inst.HW]
+AddReg = VioGpu3D_PCI_MSIX
+
+[VioGpu3D_Service_Inst]
+ServiceType   = 1   ; SERVICE_KERNEL_DRIVER
+StartType     = 3   ; SERVICE_DEMAND_START
+ErrorControl  = 0   ; SERVICE_ERROR_IGNORE
+ServiceBinary = %13%\viogpu3d.sys
+
+[VioGpu3D_EventLog_Inst]
+AddReg = VioGpu3D_EventLog_Inst.AddReg
+
+[VioGpu3D_EventLog_Inst.AddReg]
+HKR,,EventMessageFile,0x00020000,"%%SystemRoot%%\System32\IoLogMsg.dll"
+HKR,,TypesSupported,0x00010001,7
+
+[VioGpu3D_DeviceSettings]
+HKR,, HWCursor,          0x00010001, 1
+HKR,, FlexResolution,    0x00010001, 1
+HKR,, UsePhysicalMemory, 0x00010001, 0
+HKR,, UserModeDriverName, 0x00010000, %13%\loophole_umd.dll,%13%\loophole_umd.dll,%13%\loophole_umd.dll,%13%\loophole_umd.dll
+HKR,, UserModeDriverNameWow, 0x00010000, %13%\loophole32_umd.dll,%13%\loophole32_umd.dll,%13%\loophole32_umd.dll,%13%\loophole32_umd.dll
+; The Vulkan loader finds RADV through the adapter (the manifests' paths are
+; relative to them).
+HKR,, VulkanDriverName, 0x00010000, %13%\radeon_icd.json
+HKR,, VulkanDriverNameWow, 0x00010000, %13%\radeon_icd32.json
+
+[VioGpu3D_PCI_MSIX]
+HKR, "Interrupt Management",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties",, 0x00000010
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MSISupported, 0x00010001, 0
+HKR, "Interrupt Management\MessageSignaledInterruptProperties", MessageNumberLimit, 0x00010001, 4
+
+[Strings]
+Provider            = "loophole"
+DiskId1             = "loophole viogpu3d package"
+VioGpu3D.DeviceDesc = "VirtIO GPU (loophole)"

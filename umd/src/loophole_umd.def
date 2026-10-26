@@ -1,0 +1,4 @@
+LIBRARY loophole_umd.dll
+EXPORTS
+    OpenAdapter10_2=loophole_OpenAdapter10_2
+    OpenAdapter12=loophole_OpenAdapter12

@@ -1,0 +1,8 @@
+{
+    "file_format_version": "1.0.1",
+    "ICD": {
+        "library_path": ".\\vulkan_radeon32.dll",
+        "library_arch": "32",
+        "api_version": "1.4.354"
+    }
+}
