@@ -1900,6 +1900,15 @@ NTSTATUS VioGpuAdapter::Escape(_In_ CONST DXGKARG_ESCAPE *pEscape)
                 }
                 return GateArm(pDevice, pVioGpuEscape->GateArm.RingIdx, &pVioGpuEscape->GateArm.Token);
             }
+        case VIOGPU_GATE_COMPLETE:
+            {
+                size = sizeof(VIOGPU_GATE_COMPLETE_REQ);
+                if (pVioGpuEscape->DataLength < size)
+                {
+                    return STATUS_INVALID_BUFFER_SIZE;
+                }
+                return GateComplete(pVioGpuEscape->GateComplete.Token);
+            }
         case VIOGPU_PRESENT_GATE_HINT:
             {
                 return MarkThreadTokenPacketGate(PsGetCurrentThreadId()) ? STATUS_SUCCESS : STATUS_NOT_FOUND;
@@ -2008,6 +2017,7 @@ NTSTATUS VioGpuAdapter::GateArm(VioGpuDevice *pDevice, ULONG ringIdx, ULONGLONG 
     RtlZeroMemory(g, sizeof(*g));
     g->pAdapter = this;
     g->Token = (ULONGLONG)InterlockedIncrement64(&m_GateTokenNext);
+    g->Deferred = (ringIdx == VIOGPU_GATE_DEFER);
     InitializeListHead(&g->Consumers);
 
     KIRQL oldIrql;
@@ -2016,6 +2026,10 @@ NTSTATUS VioGpuAdapter::GateArm(VioGpuDevice *pDevice, ULONG ringIdx, ULONGLONG 
     KeReleaseSpinLock(&m_GateLock, oldIrql);
 
     *outToken = g->Token;
+    if (g->Deferred)
+    {
+        return STATUS_SUCCESS;
+    }
 
     // Empty fenced SUBMIT_3D on the event ring: the host defers its
     // used-ring response until the armed proxy fires at real GPU
@@ -2035,6 +2049,30 @@ NTSTATUS VioGpuAdapter::GateArm(VioGpuDevice *pDevice, ULONG ringIdx, ULONGLONG 
         *outToken = 0;
         return STATUS_INSUFFICIENT_RESOURCES;
     }
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS VioGpuAdapter::GateComplete(ULONGLONG token)
+{
+    GATE_TOKEN_CTX *g = NULL;
+    KIRQL oldIrql;
+    KeAcquireSpinLock(&m_GateLock, &oldIrql);
+    for (LIST_ENTRY *e = m_GateList.Flink; e != &m_GateList; e = e->Flink)
+    {
+        GATE_TOKEN_CTX *cand = CONTAINING_RECORD(e, GATE_TOKEN_CTX, Entry);
+        if (cand->Token == token && cand->Deferred)
+        {
+            cand->Deferred = FALSE;
+            g = cand;
+            break;
+        }
+    }
+    KeReleaseSpinLock(&m_GateLock, oldIrql);
+    if (g == NULL)
+    {
+        return STATUS_NOT_FOUND;
+    }
+    GateFenceCb(g, NULL, NULL);
     return STATUS_SUCCESS;
 }
 

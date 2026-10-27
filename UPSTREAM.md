@@ -18,6 +18,7 @@
 12. viogpu3d: a hardware pointer, shown by the host
 13. viogpu3d: a new allocation takes over its lookup cookie
 14. viogpu3d: keep a shared blob mapped until its last device closes
+15. viogpu3d: allow monitored-fence gates to complete from a deferred UMD event
 
 and, for this build, its own `viogpu3d.vcxproj`, a self-contained `viogpu3d.rc` (upstream's
 includes its `build/` directory) and `viogpum.h` from `abi/` instead of `viogpu/shared/`.
@@ -35,6 +36,7 @@ includes its `build/` directory) and `viogpum.h` from `abi/` instead of `viogpu/
 7. triton: shared, presentable and primary textures through embedder hooks
 8. triton12: present companions through embedder hooks
 9. triton: include `stddef.h` for `offsetof`
+10. triton: monitored-fence gates the embedder completes (`VIOGPU_GATE_COMPLETE`)
 
 Their licenses are in `umd/triton/licenses`.
 

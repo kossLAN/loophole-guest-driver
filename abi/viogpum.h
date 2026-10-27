@@ -154,6 +154,9 @@ typedef struct _VIOGPU_ADAPTERINFO
 // wait for that frame.  No payload.
 #define VIOGPU_PRESENT_GATE_HINT     0x402
 
+#define VIOGPU_GATE_COMPLETE         0x403
+#define VIOGPU_GATE_DEFER            0xffffffffu
+
 #define VIOGPU_RING_FENCES           0x500
 
 // The blob must be shareable and its layout linear.  Width 0 turns the
@@ -327,6 +330,11 @@ typedef struct _VIOGPU_GATE_ARM_REQ
     ULONG RingIdx;    // event ring (>= NPT_EVENT_RING_BASE) to carry the fence
     ULONGLONG Token;  // out: gate token for the matching VIOGPU_CMD_GATE
 } VIOGPU_GATE_ARM_REQ;
+
+typedef struct _VIOGPU_GATE_COMPLETE_REQ
+{
+    ULONGLONG Token;
+} VIOGPU_GATE_COMPLETE_REQ;
 #pragma pack()
 
 #pragma pack(1)
@@ -378,6 +386,7 @@ typedef struct _VIOGPU_ESCAPE
         VIOGPU_PRESENT_FENCE_REQ PresentFence;
 
         VIOGPU_GATE_ARM_REQ GateArm;
+        VIOGPU_GATE_COMPLETE_REQ GateComplete;
 
         VIOGPU_RING_FENCES_REQ RingFences;
 

@@ -13,6 +13,7 @@
 #include "virtio-gpu/virgl_hw.h"
 
 #include <d3d11_3.h>
+#include <ntstatus.h>
 #include <d3dkmthk.h>
 
 #include "shared.h"
@@ -409,6 +410,66 @@ km_open(PINIT_ONCE once, PVOID param, PVOID *ctx)
    HeapFree(GetProcessHeap(), 0, infos);
    if (!km.adapter)
       TR_LOG("shared: no loophole GPU adapter");
+   return TRUE;
+}
+
+static NTSTATUS
+km_escape(VIOGPU_ESCAPE *esc)
+{
+   InitOnceExecuteOnce(&km.once, km_open, NULL, NULL);
+   if (!km.adapter)
+      return STATUS_UNSUCCESSFUL;
+   EnterCriticalSection(&km.lock);
+   if (!km.device) {
+      D3DKMT_CREATEDEVICE cd = {.hAdapter = km.adapter};
+      if (!NT_SUCCESS(km.CreateDevice(&cd))) {
+         LeaveCriticalSection(&km.lock);
+         return STATUS_UNSUCCESSFUL;
+      }
+      km.device = cd.hDevice;
+   }
+   D3DKMT_ESCAPE e = {
+      .hAdapter = km.adapter,
+      .hDevice = km.device,
+      .Type = D3DKMT_ESCAPE_DRIVERPRIVATE,
+      .pPrivateDriverData = esc,
+      .PrivateDriverDataSize = sizeof(*esc),
+   };
+   NTSTATUS st = km.Escape(&e);
+   LeaveCriticalSection(&km.lock);
+   return st;
+}
+
+BOOL
+wh_gate_arm_deferred(uint64_t *token)
+{
+   VIOGPU_ESCAPE esc = {
+      .Type = VIOGPU_ARM_GATE,
+      .DataLength = sizeof(esc.GateArm),
+      .GateArm = {.RingIdx = VIOGPU_GATE_DEFER},
+   };
+   NTSTATUS st = km_escape(&esc);
+   if (!NT_SUCCESS(st) || !esc.GateArm.Token) {
+      TR_LOG("gate: deferred arm failed 0x%lx", st);
+      return FALSE;
+   }
+   *token = esc.GateArm.Token;
+   return TRUE;
+}
+
+BOOL
+wh_gate_complete(uint64_t token)
+{
+   VIOGPU_ESCAPE esc = {
+      .Type = VIOGPU_GATE_COMPLETE,
+      .DataLength = sizeof(esc.GateComplete),
+      .GateComplete = {.Token = token},
+   };
+   NTSTATUS st = km_escape(&esc);
+   if (!NT_SUCCESS(st)) {
+      TR_LOG("gate: completion of %llu failed 0x%lx", (unsigned long long)token, st);
+      return FALSE;
+   }
    return TRUE;
 }
 

@@ -263,8 +263,8 @@ t12DestroyCommandQueue(D3D12DDI_HDEVICE hDevice, D3D12DDI_HCOMMANDQUEUE hQueue)
  * The gate restores the WDDM contract: (1) Signal the per-queue drain
  * fence on the inner queue -- rides the wire ring FIFO-after the ECL, so
  * it completes on the host GPU timeline after the batch; (2) arm a KMD
- * event-ring fence that fires a gate token when the host retires it at
- * that completion; (3) submit a VIOGPU_CMD_GATE{token} DMA packet on the
+ * gate token that the embedder fires once the drain fence reaches that
+ * value; (3) submit a VIOGPU_CMD_GATE{token} DMA packet on the
  * queue's kernel context.  The KMD parks the packet until the token
  * fires, so dxgkrnl's fence packets (and CPU waiters/GetCompletedValue)
  * only observe values the GPU truly reached.

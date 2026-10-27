@@ -98,4 +98,7 @@ void wh_image_destroy(struct wh_vk *vk, struct wh_image *img);
 void wh_carrier_fill(struct wh_carrier *c, const struct wh_shared_desc *d, const struct wh_format *f,
                      const struct wh_image *img, BOOL linear, BOOL primary);
 
+BOOL wh_gate_arm_deferred(uint64_t *token);
+BOOL wh_gate_complete(uint64_t token);
+
 #endif

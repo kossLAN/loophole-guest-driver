@@ -296,11 +296,67 @@ npt_d3d12_host_takes_row_major_texture(void *device)
    return FALSE;
 }
 
+struct gate_wait {
+   ID3D12Fence *fence;
+   HANDLE event;
+   HANDLE wait;
+   UINT64 token;
+};
+
+static void CALLBACK
+gate_ready(PVOID param, BOOLEAN fired)
+{
+   (void)fired;
+   struct gate_wait *g = param;
+   wh_gate_complete(g->token);
+   UnregisterWaitEx(g->wait, NULL);
+   CloseHandle(g->event);
+   ID3D12Fence_Release(g->fence);
+   HeapFree(GetProcessHeap(), 0, g);
+}
+
+static void
+gate_abandon(struct gate_wait *g)
+{
+   if (g->wait)
+      UnregisterWaitEx(g->wait, INVALID_HANDLE_VALUE);
+   if (g->token)
+      wh_gate_complete(g->token);
+   if (g->event)
+      CloseHandle(g->event);
+   if (g->fence)
+      ID3D12Fence_Release(g->fence);
+   HeapFree(GetProcessHeap(), 0, g);
+}
+
 BOOL
 npt_d3d12_ecl_gate_arm(void *fence, UINT64 value, UINT64 *token)
 {
-   (void)fence, (void)value, (void)token;
-   return FALSE;
+   struct gate_wait *g = HeapAlloc(GetProcessHeap(), 0, sizeof(*g));
+   if (!g)
+      return FALSE;
+   *g = (struct gate_wait){.fence = fence};
+   ID3D12Fence_AddRef(g->fence);
+   g->event = CreateEventW(NULL, FALSE, FALSE, NULL);
+   if (!g->event || !wh_gate_arm_deferred(&g->token)) {
+      gate_abandon(g);
+      return FALSE;
+   }
+   if (!RegisterWaitForSingleObject(&g->wait, g->event, gate_ready, g, INFINITE, WT_EXECUTEONLYONCE)) {
+      gate_abandon(g);
+      return FALSE;
+   }
+   const UINT64 kmdToken = g->token;
+   HRESULT hr = ID3D12Fence_SetEventOnCompletion(g->fence, value, g->event);
+   if (FAILED(hr)) {
+      static LONG failures;
+      if (InterlockedIncrement(&failures) <= 4)
+         LOG("gate: SetEventOnCompletion(%llu) failed 0x%08lx", (unsigned long long)value, hr);
+      gate_abandon(g);
+      return FALSE;
+   }
+   *token = kmdToken;
+   return TRUE;
 }
 
 struct npt_ring;

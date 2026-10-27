@@ -663,10 +663,11 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
     //
     // A gate bridges the gap: the UMD arms an event-ring fence that the
     // host retires at true GPU completion of the queue's work
-    // (VIOGPU_ARM_GATE -> GateFenceCb), and submits a small DMA packet on
-    // the queue's kernel context (VIOGPU_CMD_GATE{token}) whose completion
-    // is parked until the token fires.  dxgkrnl then releases the
-    // monitored-fence packets only after the GPU truly drained.
+    // (VIOGPU_ARM_GATE -> GateFenceCb), or reports that completion itself
+    // for a deferred arm (VIOGPU_GATE_COMPLETE), and submits a small DMA
+    // packet on the queue's kernel context (VIOGPU_CMD_GATE{token}) whose
+    // completion is parked until the token fires.  dxgkrnl then releases
+    // the monitored-fence packets only after the GPU truly drained.
     struct GATE_CONSUMER
     {
         LIST_ENTRY Entry;
@@ -682,11 +683,13 @@ class VioGpuAdapter final : public HandleBase<"VIOGADAP"_M, VioGpuAdapter>, IVio
         BOOLEAN Fired;
         BOOLEAN Consumed;
         BOOLEAN Expired;      // deadline completed the parked consumers early
+        BOOLEAN Deferred;
         ULONGLONG ParkTime;   // KeQueryInterruptTime at first consumer park; 0 = none
         ULONGLONG FiredAt;    // KeQueryInterruptTime of a fire nobody had consumed yet
         LIST_ENTRY Consumers; // GATE_CONSUMER
     };
     NTSTATUS GateArm(class VioGpuDevice *pDevice, ULONG ringIdx, ULONGLONG *outToken);
+    NTSTATUS GateComplete(ULONGLONG token);
     void GateConsume(ULONGLONG token, void (*cb)(void *, void *, void *), void *ctx, UINT fenceId);
     static void GateFenceCb(void *ctx, void *, void *);
 
