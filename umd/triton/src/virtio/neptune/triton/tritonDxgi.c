@@ -608,7 +608,7 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
       tritonResourceSyncPresentCompanion(pD, src);
       tritonPresentUnlock(pD);
    }
-   tritonPresentFlushAndGate(pD, TRUE /* arm */, FALSE /* wait */);
+   tritonPresentFlushAndGate(pD, TRUE /* arm */, !src->IsPresentable /* wait */);
 
    /* DXGIDDICB_PRESENT (MSDN):
     *   hSrcAllocation  the rendered back buffer to present (a flip-primary
@@ -1346,7 +1346,7 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
       tritonResourceSyncPresentCompanion(pD, src);
       tritonPresentUnlock(pD);
    }
-   tritonPresentFlushAndGate(pD, TRUE /* arm */, FALSE /* wait */);
+   tritonPresentFlushAndGate(pD, TRUE /* arm */, !src->IsPresentable /* wait */);
 
    DXGIDDICB_PRESENT cb;
    memset(&cb, 0, sizeof(cb));
