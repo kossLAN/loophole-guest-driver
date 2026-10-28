@@ -98,6 +98,17 @@ void wh_image_destroy(struct wh_vk *vk, struct wh_image *img);
 void wh_carrier_fill(struct wh_carrier *c, const struct wh_shared_desc *d, const struct wh_format *f,
                      const struct wh_image *img, BOOL linear, BOOL primary);
 
+struct ID3D12Device;
+struct ID3D12GraphicsCommandList;
+struct ID3D12Resource;
+struct wh_companion;
+
+struct wh_companion *wh_companion_create(struct ID3D12Device *d3d12, DXGI_FORMAT format, UINT width, UINT height,
+                                         struct wh_carrier *c);
+BOOL wh_companion_record_copy(struct ID3D12Device *d3d12, struct ID3D12GraphicsCommandList *list,
+                              struct ID3D12Resource *src_resource, UINT src_state, struct wh_companion *s);
+void wh_companion_destroy(struct ID3D12Device *d3d12, struct wh_companion *s);
+
 BOOL wh_gate_arm_deferred(uint64_t *token);
 BOOL wh_gate_complete(uint64_t token);
 

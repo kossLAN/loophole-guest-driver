@@ -104,8 +104,8 @@ Section "-post"
   ${EndIf}
 SectionEnd
 
-LangString DESC_Drivers ${LANG_ENGLISH} "The driver for the virtual GPU (display, Vulkan, Direct3D 10-12). Enables test-signing mode."
-LangString DESC_Layers ${LANG_ENGLISH} "DXVK, vkd3d-proton and Zink for Direct3D 8/9 and OpenGL games. Right-click a game's .exe to use them for that game."
+LangString DESC_Drivers ${LANG_ENGLISH} "The driver for the virtual GPU (display, Vulkan, Direct3D 8-12, OpenGL). Enables test-signing mode."
+LangString DESC_Layers ${LANG_ENGLISH} "DXVK, vkd3d-proton and Zink in place of the driver for chosen games. Right-click a game's .exe to use them for that game."
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecDrivers} $(DESC_Drivers)
   !insertmacro MUI_DESCRIPTION_TEXT ${SecLayers} $(DESC_Layers)

@@ -556,6 +556,7 @@ tritonSharedBridgeOpenRes(void *device, uint32_t res_id, const struct triton_sha
 
 HRESULT APIENTRY OpenAdapter10_2(void *args);
 HRESULT APIENTRY OpenAdapter12(void *args);
+HRESULT APIENTRY OpenAdapter9(void *args);
 
 static BOOL
 listed(const char *value, const char *exe)
@@ -602,4 +603,10 @@ HRESULT APIENTRY
 loophole_OpenAdapter12(void *args)
 {
    return app_enabled() ? OpenAdapter12(args) : E_FAIL;
+}
+
+HRESULT APIENTRY
+loophole_OpenAdapter(void *args)
+{
+   return app_enabled() ? OpenAdapter9(args) : E_FAIL;
 }

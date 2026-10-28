@@ -4,9 +4,10 @@ The Windows gpu driver for [loophole](https://github.com/kossLAN/loophole)
 
 ```
  application / DWM
-   │ Direct3D 10-12
+   │ Direct3D 8-12, OpenGL
    ▼
- loophole_umd.dll      umd/           Triton on DXVK (D3D11) and vkd3d-proton (D3D12)
+ loophole_umd.dll      umd/           Triton on DXVK (D3D11) and vkd3d-proton (D3D12), D3D9On12 (D3D8/9)
+ loophole_wgl.dll      third_party/   Mesa's Zink (OpenGL)
    │ Vulkan
    ▼
  vulkan_radeon.dll     third_party/   RADV, its amdgpu winsys over viogpu3d's escapes

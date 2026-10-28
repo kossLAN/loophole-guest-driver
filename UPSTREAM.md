@@ -40,6 +40,11 @@ includes its `build/` directory) and `viogpum.h` from `abi/` instead of `viogpu/
 
 Their licenses are in `umd/triton/licenses`.
 
+## umd/src/d3d9on12ddi.h
+
+`interface/d3d9on12ddi.h` from [microsoft/D3D9On12](https://github.com/microsoft/D3D9On12) (MIT),
+without its byte-order mark and with Unix line endings.
+
 ## third_party/
 
 Submodules on loophole's forks, branch `loophole`: `git log <base>..loophole` in each lists its

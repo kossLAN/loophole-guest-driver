@@ -56,6 +56,7 @@ shared_library(
   'loophole_umd',
   'src/backend.c',
   'src/crossadapter.c',
+  'src/d3d9.c',
   'src/shared.c',
   'src/shared12.c',
   name_prefix: '',
