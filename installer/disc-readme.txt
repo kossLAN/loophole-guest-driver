@@ -6,7 +6,7 @@ Run loophole-setup.exe once Windows is installed. It installs:
 - the GPU driver: display, Vulkan (RADV) and Direct3D 10-12, which every
   application and the desktop use;
 - an agent that keeps the desktop at the size and refresh rate of the
-  loophole window;
+  loophole window, and shares copied text with the host;
 - translation layers for Direct3D 8/9 and OpenGL games: right-click a game's
   .exe and choose "Use loophole for Direct3D and OpenGL".
 

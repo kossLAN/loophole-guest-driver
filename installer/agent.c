@@ -12,13 +12,13 @@
 #include <winternl.h>
 #include <d3dkmthk.h>
 
+#include "agent.h"
 #include "viogpum.h"
 
 #define RESOLUTION_EVENT L"Global\\VioGpuResolutionEvent"
 
 #define VIRTIO_GPU_ID L"PCI\\VEN_1AF4&DEV_1050"
 #define MAX_DISPLAYS 8
-#define POLL_MS 5000
 /* Windows takes a moment to re-read the monitor after an event. */
 #define SETTLE_MS 1000
 #define SETTLE_CHECKS 3
@@ -27,6 +27,7 @@ static PFND3DKMT_OPENADAPTERFROMHDC open_adapter;
 static PFND3DKMT_CLOSEADAPTER close_adapter;
 static PFND3DKMT_ESCAPE escape;
 static FILE *logf;
+static SRWLOCK log_lock = SRWLOCK_INIT;
 
 struct display {
    wchar_t name[CCHDEVICENAME];
@@ -36,19 +37,21 @@ struct display {
    unsigned settle;
 };
 
-static void
+void
 say(const wchar_t *fmt, ...)
 {
    if (!logf)
       return;
    SYSTEMTIME t;
    GetLocalTime(&t);
+   AcquireSRWLockExclusive(&log_lock);
    fwprintf(logf, L"%02u:%02u:%02u ", t.wHour, t.wMinute, t.wSecond);
    va_list ap;
    va_start(ap, fmt);
    vfwprintf(logf, fmt, ap);
    va_end(ap);
    fflush(logf);
+   ReleaseSRWLockExclusive(&log_lock);
 }
 
 static LONG
@@ -260,6 +263,12 @@ wWinMain(HINSTANCE inst, HINSTANCE prev, PWSTR cmdline, int show)
    if (GetLastError() == ERROR_ALREADY_EXISTS)
       return 0;
    open_log();
+
+   HANDLE clipboard = CreateThread(NULL, 0, clipboard_thread, NULL, 0, NULL);
+   if (clipboard)
+      CloseHandle(clipboard);
+   else
+      say(L"no clipboard thread (%lu)\n", GetLastError());
 
    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
    open_adapter = (void *)GetProcAddress(gdi, "D3DKMTOpenAdapterFromHdc");

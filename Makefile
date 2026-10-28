@@ -102,9 +102,11 @@ out/x64/setup/loophole.exe: installer/setup.c build/wdk/.stamp
 	@mkdir -p $(@D)
 	$(triple.x64)-gcc $(setup-flags) -o $@ $< -lsetupapi -lcfgmgr32 -lcrypt32 -ladvapi32 -luser32 -lshell32
 
-out/x64/setup/loophole-agent.exe: installer/agent.c abi/viogpum.h build/wdk/.stamp
+agent-src = installer/agent.c installer/clipboard.c
+
+out/x64/setup/loophole-agent.exe: $(agent-src) installer/agent.h abi/clipboard.h abi/viogpum.h build/wdk/.stamp
 	@mkdir -p $(@D)
-	$(triple.x64)-gcc $(setup-flags) -mwindows -Iabi -o $@ $< -lgdi32 -luser32 -lshell32
+	$(triple.x64)-gcc $(setup-flags) -mwindows -Iabi -o $@ $(agent-src) -lgdi32 -luser32 -lshell32 -lsetupapi -ladvapi32
 
 x64: out/x64/setup/loophole.exe out/x64/setup/loophole-agent.exe
 
