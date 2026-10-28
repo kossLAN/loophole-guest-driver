@@ -2,13 +2,10 @@ name: Build
 
 on:
   push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
+    tags: ['*']
 
 concurrency:
   group: build-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -61,7 +58,6 @@ jobs:
   release:
     name: Release
     needs: package
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -76,12 +72,12 @@ jobs:
         run: |
           make iso
           (cd out/package/drivers && zip -qr ../../viogpu3d-package.zip .)
-      - name: Publish build-${{ github.run_number }}
+      - name: Publish ${{ github.ref_name }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "build-${{ github.run_number }}" \
+          gh release create "${{ github.ref_name }}" \
             out/loophole-guest.iso out/package/loophole-setup.exe out/viogpu3d-package.zip \
-            --target "${{ github.sha }}" --latest \
-            --title "loophole-guest build ${{ github.run_number }}" \
+            --verify-tag --latest \
+            --title "loophole-guest ${{ github.ref_name }}" \
             --notes "Driver $(cat out/package/version.txt) from ${{ github.sha }}."
