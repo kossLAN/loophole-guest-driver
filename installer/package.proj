@@ -7,10 +7,9 @@
     <Root>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)', '..'))</Root>
     <Out>$(Root)out\</Out>
     <Package>$(Out)package\</Package>
-    <!-- The fourth part of the driver version, by default one that changes with every build:
-         Windows reuses a staged package whose INF is unchanged, binaries and all. -->
-    <BuildNumber Condition="'$(BuildNumber)' == ''">$([MSBuild]::Add($([MSBuild]::Multiply($([System.DateTime]::Now.Hour), 100)), $([System.DateTime]::Now.Minute)))</BuildNumber>
-    <Version>1.0.0.$(BuildNumber)</Version>
+    <Tag Condition="'$(Tag)' == ''">v0.0.0</Tag>
+    <Version>$(Tag.TrimStart('v'))</Version>
+    <DriverVersion>$(Version).0</DriverVersion>
 
     <KitsRoot Condition="'$(KitsRoot)' == ''">$([MSBuild]::GetRegistryValueFromView('HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows Kits\Installed Roots', 'KitsRoot10', null, RegistryView.Registry32))</KitsRoot>
     <!-- The SDK kmd\viogpu3d.vcxproj builds against. -->
@@ -47,20 +46,21 @@
   </ItemGroup>
 
   <Target Name="Package">
-    <MSBuild Projects="$(Root)kmd\viogpu3d.vcxproj" Properties="Configuration=$(Configuration);Platform=x64;LoopholeVersion=$(Version)" />
+    <Error Condition="!$([System.Text.RegularExpressions.Regex]::IsMatch('$(Version)', '^\d+\.\d+\.\d+$'))" Text="release tags look like v0.0.3 (got '$(Tag)')" />
+    <MSBuild Projects="$(Root)kmd\viogpu3d.vcxproj" Properties="Configuration=$(Configuration);Platform=x64;LoopholeVersion=$(DriverVersion)" />
     <Error Condition="!Exists('%(DriverFile.FullPath)')" Text="missing %(DriverFile.FullPath): build out\x64 and out\x86 first (make, on Linux)" />
 
     <RemoveDir Directories="$(Package)" />
     <Copy SourceFiles="@(DriverFile)" DestinationFiles="@(DriverFile->'$(Package)drivers\%(Name)')" />
-    <Exec Command="&quot;$(StampInf)&quot; -f &quot;$(Package)drivers\viogpu3d.inf&quot; -d &quot;*&quot; -v $(Version)" />
+    <Exec Command="&quot;$(StampInf)&quot; -f &quot;$(Package)drivers\viogpu3d.inf&quot; -d &quot;*&quot; -v $(DriverVersion)" />
     <Copy Condition="Exists('$(Out)kmd\$(Configuration)\viogpu3d.pdb')" SourceFiles="$(Out)kmd\$(Configuration)\viogpu3d.pdb" DestinationFolder="$(Package)symbols" />
     <Exec Command="&quot;$(Inf2Cat)&quot; /driver:&quot;$(Package)drivers&quot; /os:10_X64 /uselocaltime" />
     <Exec Command="&quot;$(SignTool)&quot; sign /q /fd SHA256 /f &quot;$(Root)kmd\cert\loophole-test.pfx&quot; /p loophole &quot;$(Package)drivers\viogpu3d.cat&quot;" />
 
     <Copy SourceFiles="@(Layer)" DestinationFolder="$(Package)layers\%(Arch)" />
-    <Exec Command="&quot;$(MakeNsis)&quot; -V2 -INPUTCHARSET UTF8 -DVERSION=1.0.$(BuildNumber) &quot;-DTOOLS=$(Out)x64\setup&quot; &quot;-DPACKAGE=$(Package.TrimEnd('\'))&quot; &quot;$(Root)installer\loophole.nsi&quot;" />
+    <Exec Command="&quot;$(MakeNsis)&quot; -V2 -INPUTCHARSET UTF8 -DVERSION=$(Version) &quot;-DTOOLS=$(Out)x64\setup&quot; &quot;-DPACKAGE=$(Package.TrimEnd('\'))&quot; &quot;$(Root)installer\loophole.nsi&quot;" />
 
-    <WriteLinesToFile File="$(Package)version.txt" Lines="$(Version)" Overwrite="true" />
-    <Message Importance="high" Text="driver $(Version): $(Package)" />
+    <WriteLinesToFile File="$(Package)version.txt" Lines="$(DriverVersion)" Overwrite="true" />
+    <Message Importance="high" Text="driver $(DriverVersion): $(Package)" />
   </Target>
 </Project>
