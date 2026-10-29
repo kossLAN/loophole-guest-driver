@@ -245,6 +245,12 @@ static inline void tritonSetError(PTRITON_DEVICE pD, HRESULT hr)
         pD->pUMCallbacks->pfnSetErrorCb(pD->hRTCoreLayer, hr);
 }
 
+static inline void tritonPerformAmortizedProcessing(PTRITON_DEVICE pD)
+{
+    if (pD && pD->pUMCallbacks && pD->pUMCallbacks->pfnPerformAmortizedProcessingCb)
+        pD->pUMCallbacks->pfnPerformAmortizedProcessingCb(pD->hRTCoreLayer);
+}
+
 /* Create and Open DDIs may report only E_OUTOFMEMORY or
  * D3DDDIERR_DEVICEREMOVED; the runtime treats any other code as a driver bug
  * and removes the device.  E_OUTOFMEMORY is what the app's create then

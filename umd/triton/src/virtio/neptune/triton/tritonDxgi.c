@@ -624,6 +624,7 @@ tritonDxgiPresent(DXGI_DDI_ARG_PRESENT *pArgs)
    cb.hContext       = pD->hKMContext;
    HRESULT hr = tritonPresentSubmitCb(pD, &cb);
    InterlockedDecrement(&pD->presentInFlight);
+   tritonPerformAmortizedProcessing(pD);
    return hr;
 }
 
@@ -1356,6 +1357,7 @@ tritonDxgiPresent1(DXGI_DDI_ARG_PRESENT1 *pArgs)
    cb.hContext       = pD->hKMContext;
    HRESULT hr = tritonPresentSubmitCb(pD, &cb);
    InterlockedDecrement(&pD->presentInFlight);
+   tritonPerformAmortizedProcessing(pD);
    return hr;
 }
 

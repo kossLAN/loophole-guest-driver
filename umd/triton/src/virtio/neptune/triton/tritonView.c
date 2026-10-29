@@ -306,6 +306,7 @@ tritonFlush(D3D10DDI_HDEVICE hDevice)
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     if (!pD || !pD->pCtx1) return;
     ID3D11DeviceContext1_Flush(pD->pCtx1);
+    tritonPerformAmortizedProcessing(pD);
 }
 
 BOOL APIENTRY
@@ -315,6 +316,7 @@ tritonFlush11_1(D3D10DDI_HDEVICE hDevice, UINT FlushFlags)
     PTRITON_DEVICE pD = (PTRITON_DEVICE)(hDevice.pDrvPrivate);
     if (!pD || !pD->pCtx1) return FALSE;
     ID3D11DeviceContext1_Flush(pD->pCtx1);
+    tritonPerformAmortizedProcessing(pD);
     return TRUE;
 }
 
@@ -892,6 +894,7 @@ tritonFlush_WDDM2_0(D3D10DDI_HDEVICE hDevice, UINT ContextType, UINT FlushFlags)
     if (!pD) return FALSE;
     if (pD->pCtx3) {
         ID3D11DeviceContext3_Flush1(pD->pCtx3, tritonContextFlagToEnum(ContextType), NULL);
+        tritonPerformAmortizedProcessing(pD);
         return TRUE;
     }
     return tritonFlush11_1(hDevice, FlushFlags);
