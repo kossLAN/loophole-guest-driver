@@ -939,6 +939,7 @@ template <typename DESC> static void FillApertureSegment(DESC *pDesc)
     pDesc->Flags.CacheCoherent = TRUE;
     pDesc->Flags.CpuVisible = FALSE;
     pDesc->Flags.DirectFlip = TRUE;
+    pDesc->Flags.NonLocalBudgetGroup = TRUE;
 }
 
 template <typename DESC> void VioGpuAdapter::FillShmemSegment(DESC *pDesc)
@@ -952,6 +953,7 @@ template <typename DESC> void VioGpuAdapter::FillShmemSegment(DESC *pDesc)
     pDesc->Flags.CacheCoherent = TRUE;
     pDesc->Flags.CpuVisible = TRUE;
     pDesc->Flags.DirectFlip = TRUE;
+    pDesc->Flags.LocalBudgetGroup = TRUE;
 }
 
 NTSTATUS VioGpuAdapter::QueryAdapterInfo(_In_ CONST DXGKARG_QUERYADAPTERINFO *pQueryAdapterInfo)
